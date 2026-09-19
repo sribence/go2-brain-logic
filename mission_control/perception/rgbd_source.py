@@ -68,6 +68,12 @@ class RealSenseSource(RGBDSource):
         import pyrealsense2 as rs
 
         self._rs = rs
+        if os.environ.get("RS_HW_RESET") == "1":
+            devs = rs.context().query_devices()
+            if len(devs):
+                logger.warning("realsense hardware reset before reopen")
+                devs[0].hardware_reset()
+                time.sleep(5)          # the device re-enumerates on USB
         self._pipe = rs.pipeline()
         cfg = rs.config()
         cfg.enable_stream(rs.stream.color, width, height, rs.format.bgr8, fps)

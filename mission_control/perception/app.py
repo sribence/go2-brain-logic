@@ -210,6 +210,7 @@ class Pipeline:
             except ModelSwitchError as exc:
                 logger.warning("engine auto-build not started: %s", exc)
         source = None
+        misses = 0
         while not self._stop.is_set():
             if source is None:
                 try:
@@ -224,8 +225,21 @@ class Pipeline:
                     continue
             frame = source.read(timeout_s=2.0)
             if frame is None:
+                misses += 1
                 self._fail("no frame within 2 s")
+                if misses >= 3:
+                    # The camera sometimes stalls on the first start after a
+                    # robot boot. Reopen it (with a hardware reset) instead of
+                    # waiting forever.
+                    log_event("warn", "rgbd source stalled, reopening", source=source.name)
+                    try:
+                        source.close()
+                    except Exception:
+                        pass
+                    source, misses = None, 0
+                    os.environ["RS_HW_RESET"] = "1"
                 continue
+            misses = 0
             t0 = time.time()
             try:
                 result = self.tracker.process(frame)

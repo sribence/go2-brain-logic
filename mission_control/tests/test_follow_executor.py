@@ -42,10 +42,26 @@ def test_blocks(f, h, enabled, why):
     assert not send and vx == 0 and vyaw == 0 and why in reason
 
 
-def test_never_reverses_and_rejects_nan():
-    send, vx, vyaw, _ = decide(follow(command={"vx": -0.3, "vyaw": float("nan"), "dry_run": False}),
+def test_rejects_nan():
+    send, vx, vyaw, _ = decide(follow(command={"vx": float("nan"), "vyaw": float("nan"), "dry_run": False}),
                                ARMED, True, max_vx=0.5, max_vyaw=0.5)
     assert send and vx == 0.0 and vyaw == 0.0
+
+
+def test_reverse_is_clamped_to_back_limit():
+    f = follow(command={"vx": -0.5, "vyaw": 0.0, "dry_run": False})
+    assert decide(f, ARMED, True, max_vx=0.4, max_vx_back=0.2)[1] == -0.2
+    assert decide(f, ARMED, True, max_vx=0.4, max_vx_back=0.0)[1] == 0.0
+
+
+def test_limits_can_only_be_lowered():
+    from executor import EXEC_MAX_VX, Executor
+    e = Executor()
+    e.set_limits({"max_vx": EXEC_MAX_VX / 2})
+    assert e.limits["max_vx"] == EXEC_MAX_VX / 2
+    for bad in ({"max_vx": EXEC_MAX_VX + 0.1}, {"max_vyaw": -1}, {"speed": 1}, {"max_vx": float("nan")}):
+        with pytest.raises(ValueError):
+            e.set_limits(bad)
 
 
 def test_ego_delta_forward_in_rotated_frame():

@@ -10,7 +10,8 @@ Every 1/RATE_HZ seconds:
      perception /follow/ego (keeps the follower's gate on the person while
      the robot turns or walks);
   2. read perception /follow and mc_motion /health;
-  3. POST mc_motion /move only when ALL of these hold (`decide()`):
+  3. POST mc_motion /move only when ALL of these hold (`decide()`), with vx
+     clamped to [-max_vx_back, max_vx] and vyaw to +-max_vyaw:
        - executor enabled (not latched off by a remote override)
        - mc_motion armed (only the operator arms; this process never does)
        - command dry_run is false
@@ -20,8 +21,10 @@ Every 1/RATE_HZ seconds:
      mc_motion watchdog also stops the robot if this process dies.
 
 A new remote override seen in mc_motion /health latches the executor off
-until POST /enable on the status port. Stage limits (EXEC_MAX_VX,
-EXEC_MAX_VYAW) clamp on top of the follower's and mc_motion's own limits.
+until POST /enable on the status port. The limits (EXEC_MAX_VX,
+EXEC_MAX_VX_BACK, EXEC_MAX_VYAW) clamp on top of the follower's and
+mc_motion's own limits. POST /limits lowers them at runtime (the console's
+speed sliders); the env values are hard caps it cannot exceed.
 """
 from __future__ import annotations
 
@@ -37,10 +40,13 @@ from typing import Optional
 PERCEPTION = os.environ.get("PERCEPTION_URL", "http://127.0.0.1:9112")
 MOTION = os.environ.get("MOTION_URL", "http://127.0.0.1:9102")
 PORT = int(os.environ.get("EXECUTOR_PORT", "9113"))
-RATE_HZ = float(os.environ.get("RATE_HZ", "10"))
+RATE_HZ = float(os.environ.get("RATE_HZ", "20"))
 MAX_RESULT_AGE_S = float(os.environ.get("MAX_RESULT_AGE_S", "0.4"))
-EXEC_MAX_VX = float(os.environ.get("EXEC_MAX_VX", "0.0"))      # stage 1: turn only
-EXEC_MAX_VYAW = float(os.environ.get("EXEC_MAX_VYAW", "0.4"))
+# Hard caps. POST /limits can lower the working limits at runtime, never raise
+# them above these.
+EXEC_MAX_VX = float(os.environ.get("EXEC_MAX_VX", "0.4"))            # forward, m/s
+EXEC_MAX_VX_BACK = float(os.environ.get("EXEC_MAX_VX_BACK", "0.2"))  # backward, m/s
+EXEC_MAX_VYAW = float(os.environ.get("EXEC_MAX_VYAW", "0.8"))        # rad/s
 HTTP_TIMEOUT_S = 0.25
 
 
@@ -52,7 +58,8 @@ def _clamp(v: float, limit: float) -> float:
 
 def decide(follow: Optional[dict], health: Optional[dict], enabled: bool,
            max_vx: float = EXEC_MAX_VX, max_vyaw: float = EXEC_MAX_VYAW,
-           max_age_s: float = MAX_RESULT_AGE_S) -> tuple[bool, float, float, str]:
+           max_age_s: float = MAX_RESULT_AGE_S,
+           max_vx_back: float = EXEC_MAX_VX_BACK) -> tuple[bool, float, float, str]:
     """(send, vx, vyaw, reason). Pure: every gate in one testable place."""
     if not enabled:
         return False, 0.0, 0.0, "executor disabled (remote override or operator)"
@@ -72,7 +79,8 @@ def decide(follow: Optional[dict], health: Optional[dict], enabled: bool,
         return False, 0.0, 0.0, f"state {follow.get('state')}"
     if follow.get("hold"):
         return False, 0.0, 0.0, "hold"
-    vx = max(0.0, _clamp(cmd.get("vx", 0.0), max_vx))           # never reverse
+    vx = _clamp(cmd.get("vx", 0.0), max(max_vx, max_vx_back))
+    vx = min(vx, max_vx) if vx > 0 else max(vx, -max_vx_back)
     vyaw = _clamp(cmd.get("vyaw", 0.0), max_vyaw)
     return True, vx, vyaw, "tracking"
 
@@ -117,6 +125,22 @@ class Executor:
         self.overrides_seen: Optional[int] = None
         self._odom_prev: Optional[tuple] = None
         self.events: list = []
+        self.limits = {"max_vx": EXEC_MAX_VX, "max_vx_back": EXEC_MAX_VX_BACK, "max_vyaw": EXEC_MAX_VYAW}
+
+    def set_limits(self, body: dict) -> None:
+        """Lower (or restore) the working limits. A value above the hard cap,
+        a negative or non-finite value, or an unknown key raises ValueError."""
+        caps = {"max_vx": EXEC_MAX_VX, "max_vx_back": EXEC_MAX_VX_BACK, "max_vyaw": EXEC_MAX_VYAW}
+        new = dict(self.limits)
+        for k, v in body.items():
+            if k not in caps:
+                raise ValueError(f"unknown limit {k!r}, allowed: {sorted(caps)}")
+            v = float(v)
+            if not math.isfinite(v) or v < 0 or v > caps[k]:
+                raise ValueError(f"{k} must be between 0 and {caps[k]}")
+            new[k] = v
+        self.limits = new
+        self.log(f"limits set to {new}")
 
     def log(self, msg: str) -> None:
         self.events.append({"t": time.time(), "msg": msg})
@@ -144,7 +168,9 @@ class Executor:
             self._odom_prev = None
 
         follow = _get(f"{PERCEPTION}/follow")
-        send, vx, vyaw, reason = decide(follow, health, self.enabled)
+        lim = self.limits
+        send, vx, vyaw, reason = decide(follow, health, self.enabled, max_vx=lim["max_vx"],
+                                        max_vyaw=lim["max_vyaw"], max_vx_back=lim["max_vx_back"])
         if reason != self.reason:
             self.log(f"{self.reason} -> {reason}")
         self.reason = reason
@@ -163,7 +189,7 @@ class Executor:
 
     def run(self) -> None:
         period = 1.0 / RATE_HZ
-        self.log(f"start: limits vx<={EXEC_MAX_VX} vyaw<={EXEC_MAX_VYAW}, {RATE_HZ} Hz")
+        self.log(f"start: limits vx<={EXEC_MAX_VX} back<={EXEC_MAX_VX_BACK} vyaw<={EXEC_MAX_VYAW}, {RATE_HZ} Hz")
         while True:
             t0 = time.time()
             try:
@@ -179,7 +205,9 @@ class Executor:
         return {"enabled": self.enabled, "moving": self.moving, "reason": self.reason,
                 "last_cmd": {"vx": self.last_cmd[0], "vyaw": self.last_cmd[1]},
                 "sent": self.sent, "stops": self.stops,
-                "limits": {"max_vx": EXEC_MAX_VX, "max_vyaw": EXEC_MAX_VYAW},
+                "limits": dict(self.limits),
+                "hard_caps": {"max_vx": EXEC_MAX_VX, "max_vx_back": EXEC_MAX_VX_BACK,
+                              "max_vyaw": EXEC_MAX_VYAW},
                 "events": self.events[-10:][::-1], "t": time.time()}
 
 
@@ -200,6 +228,13 @@ class Handler(BaseHTTPRequestHandler):
         self._send(200, EXEC.status()) if self.path in ("/", "/status") else self._send(404, {})
 
     def do_POST(self):
+        if self.path == "/limits":
+            try:
+                n = int(self.headers.get("Content-Length") or 0)
+                EXEC.set_limits(json.loads(self.rfile.read(n) or b"{}"))
+            except (ValueError, TypeError, AttributeError) as exc:
+                return self._send(422, {"detail": str(exc)})
+            return self._send(200, EXEC.status())
         if self.path == "/enable":
             EXEC.enabled = True
             EXEC.log("enabled by operator")
@@ -209,6 +244,13 @@ class Handler(BaseHTTPRequestHandler):
         else:
             return self._send(404, {})
         self._send(200, EXEC.status())
+
+    def do_OPTIONS(self):          # CORS preflight for JSON POSTs from the console
+        self.send_response(204)
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        self.end_headers()
 
     def log_message(self, *args):
         pass

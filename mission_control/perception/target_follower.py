@@ -44,7 +44,8 @@ class FollowConfig:
     yaw_deadband_deg: float = 6.0
     turn_first_deg: float = 45.0       # vx scaled to 0 at this bearing: turn before driving
     max_vx: float = 0.5                # m/s  (Go2 can do much more -- start slow)
-    max_reverse_vx: float = 0.0        # m/s  backing away disabled by default
+    max_reverse_vx: float = 0.2        # m/s  back away slowly when the person comes too close
+    reverse_max_bearing_deg: float = 30.0  # back away only if the person is roughly in front
     max_vyaw: float = 0.8              # rad/s
     max_accel: float = 0.5             # m/s^2, ramp-up limit (stopping is immediate)
     max_yaw_accel: float = 3.0         # rad/s^2
@@ -264,6 +265,8 @@ class TargetFollower:
                 vx = min(vx, 0.0)
             if vx > 0:
                 vx *= float(np.clip(1.0 - abs(math.degrees(bearing)) / cfg.turn_first_deg, 0.0, 1.0))
+            elif vx < 0 and abs(math.degrees(bearing)) > cfg.reverse_max_bearing_deg:
+                vx = 0.0                       # the rear is blind: never back away at an angle
 
             vyaw = 0.0 if abs(math.degrees(bearing)) < cfg.yaw_deadband_deg else cfg.k_yaw * bearing
             vyaw = float(np.clip(vyaw, -cfg.max_vyaw, cfg.max_vyaw))

@@ -15,8 +15,10 @@ A `/move` is sent only when all of these hold:
 - the follower result is younger than `MAX_RESULT_AGE_S`
 
 On any failed gate it sends one `/stop` and then nothing, so the `mc_motion`
-watchdog (0.5 s) also stops the robot if this process dies. `vx` is never
-negative and is clamped to the stage limits.
+watchdog (0.5 s) also stops the robot if this process dies. `vx` is clamped
+to `[-max_vx_back, max_vx]` and `vyaw` to `+-max_vyaw`. The follower itself
+backs away only when the person is closer than the target distance and
+within 30 degrees of straight ahead, because the rear has no camera.
 
 Each tick it also reads `mc_motion /odom` and posts the robot motion since the
 last tick to perception `POST /follow/ego`. This moves the follower gate and
@@ -26,26 +28,35 @@ the Kalman tracks into the new robot frame.
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `EXEC_MAX_VX` | `0.0` | forward limit (stage 1 = turn only) |
-| `EXEC_MAX_VYAW` | `0.4` | turn limit, rad/s |
-| `MAX_RESULT_AGE_S` | `0.4` | oldest follower result accepted. The age counts from camera capture, so it includes the camera pipeline latency (1.0-1.2 s on the robot, 2026-09-19). The robot runs with 1.5. |
-| `RATE_HZ` | `10` | loop rate |
+| `EXEC_MAX_VX` | `0.4` | forward hard cap, m/s |
+| `EXEC_MAX_VX_BACK` | `0.2` | backward hard cap, m/s |
+| `EXEC_MAX_VYAW` | `0.8` | turn hard cap, rad/s |
+| `MAX_RESULT_AGE_S` | `0.4` | oldest follower result accepted. The age counts from camera capture, so it includes the camera latency (about 0.09 s with the direct camera source). |
+| `RATE_HZ` | `20` | loop rate |
 | `PERCEPTION_URL`, `MOTION_URL` | `127.0.0.1:9112`, `:9102` | services |
 
 ## Status port
 
-`GET /status` (enabled, moving, reason, last command, counters, events),
-`POST /enable`, `POST /disable`.
+`GET /status` (enabled, moving, reason, last command, `limits`, `hard_caps`,
+counters, events), `POST /enable`, `POST /disable`.
+
+`POST /limits` `{"max_vx": 0.2, "max_vx_back": 0.1, "max_vyaw": 0.5}` sets
+the working limits. Any subset of the keys is accepted. A value can be
+between 0 and its hard cap; anything else returns 422. The limits reset to
+the hard caps when the container restarts.
 
 ## Run on the robot
 
 The executor uses only the Python standard library and runs in the existing
-`nero_go2/web_dashboard` image, like `mc_motion`. There is no restart policy,
-so it never starts on its own after a reboot.
+`nero_go2/web_dashboard` image, like `mc_motion`. Since 2026-09-19 it has
+`--restart unless-stopped`, so the console works after a reboot without a
+manual step. It still never arms `mc_motion`. Copy `executor.py` and
+`deploy.sh` to `/home/unitree/nero_go2_dev/follow_executor/`, then run
+`deploy.sh` there. The run command it uses:
 
 ```bash
-docker run -d --name nero_go2_follow_executor --network host --restart no \
-  -e EXEC_MAX_VX=0.0 -e EXEC_MAX_VYAW=0.6 -e MAX_RESULT_AGE_S=1.5 \
+docker run -d --name nero_go2_follow_executor --network host --restart unless-stopped \
+  -e EXEC_MAX_VX=0.4 -e EXEC_MAX_VX_BACK=0.2 -e EXEC_MAX_VYAW=0.8 -e MAX_RESULT_AGE_S=0.4 \
   -v /home/unitree/nero_go2_dev/follow_executor:/exec:ro \
   nero_go2/web_dashboard:latest python /exec/executor.py
 ```

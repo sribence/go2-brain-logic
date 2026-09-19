@@ -20,7 +20,8 @@ fi
 mkdir -p logs models
 docker run -d --name nero_go2_perception --runtime nvidia --network host --restart unless-stopped \
   --privileged -v /dev/bus/usb:/dev/bus/usb \
-  -e RS_SOURCE="$RS_SOURCE" -e YOLO_DEVICE=0 -e PERCEPTION_ALLOW_LIVE="${PERCEPTION_ALLOW_LIVE:-0}" \
+  -e OMP_NUM_THREADS="${OMP_NUM_THREADS:-2}" -e OPENBLAS_NUM_THREADS=2 -e MKL_NUM_THREADS=2 \
+  -e RS_SOURCE="$RS_SOURCE" -e RS_FPS="${RS_FPS:-15}" -e YOLO_DEVICE=0 -e PERCEPTION_ALLOW_LIVE="${PERCEPTION_ALLOW_LIVE:-0}" \
   -v "$ROOT/logs:/app/perception/logs" -v "$ROOT/models:/app/perception/models" \
   -v /var/lib/nvpmodel:/host/nvpmodel:ro -v /etc/nvpmodel.conf:/host/nvpmodel.conf:ro \
   nero_go2/perception:latest

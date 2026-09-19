@@ -11,28 +11,34 @@ contains a person follower that computes the `Move(vx, vy, vyaw)` command it
 the HUD, the radar and the JSON output. A live executor is a later step, and
 it must go through `core` (armed check, watchdog, E-stop).
 
-## Status (2026-09-19)
+## Status (2026-09-19, late evening)
 
 Deployed and running on the Go2 Jetson (`192.168.123.18`):
 
 | Item | Value |
 |---|---|
-| Container | `nero_go2_perception`, `--runtime nvidia --network host --restart unless-stopped` |
+| Container | `nero_go2_perception`, `--runtime nvidia --network host --restart unless-stopped --privileged` (USB) |
 | Base image | `ultralytics/ultralytics:latest-jetson-jetpack5` (13.7 GB, Python 3.8, torch 2.1 with CUDA) |
-| Source | `RS_SOURCE=rosbridge`, the `realsense_bridge` container on `localhost:9091` |
-| Model | `yolov8n.pt` on GPU (`YOLO_DEVICE=0`) |
-| Measured | loop about 17 fps, inference about 78 ms per frame |
-| Camera | color 640x480 at 15 Hz, aligned depth about 10 Hz (16-bit PNG) |
-| Follower | dry run only, no motion command leaves the container |
+| Source | `RS_SOURCE=realsense`: pyrealsense2 reads the camera directly. The `realsense_bridge` container is stopped (one camera owner). |
+| Model | `yolov8n` FP16 TensorRT engine, 640 (`models/yolov8n_640_fp16.engine`, built on the robot in 631 s) |
+| Power mode | Jetson `MAXN` (8 cores at 1.98 GHz), set 2026-09-19 |
+| Measured | 15 Hz (camera at `RS_FPS=15`), capture-to-result latency p50 about 0.09 s, inference about 19 ms, perception CPU about 26% |
+| Follower | commands go to the robot through `follow_executor` (:9113) when the operator arms `mc_motion` and turns off dry run |
+
+Latency history: over rosbridge (JPEG/PNG + base64 JSON) the capture-to-result
+latency was 1.0-1.2 s at 4-6 Hz, and the raw ROS image alone was 0.33 s old.
+With the direct source it fell to 0.36 s. With the TensorRT engine and MAXN
+it is 0.05 s at 30 fps and 0.09 s at 15 fps. `OMP_NUM_THREADS=2` is needed: without it the
+container spun 560-680% CPU. On the first start after a robot boot the camera
+can stall; after 3 missed frames (6 s) the loop reopens it with a hardware reset.
 
 Open items:
 
 - The camera mount extrinsics (`CAM_*`) are not measured yet. The defaults
   (`tx=0.30`, `tz=0.10`, no pitch or yaw) can put positions a few cm off.
-- TensorRT export (`yolov8n.engine`) for faster inference.
-- Live executor through `core`, which uses `apply_ego_motion()` with odometry
-  and honours `command.valid_until`. It needs explicit approval before any
-  test on the real robot.
+- Forward and backward following is new and not yet tested on the robot.
+- Building engines for other models or sizes (POST /model) takes about 10 min
+  each; a build next to a busy loop at 15W never finished.
 
 ## Data flow
 
@@ -196,9 +202,13 @@ are not implemented yet: the response has `executed: false`.
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `RS_SOURCE` | `mock` | `rosbridge` (robot), `realsense` (pyrealsense2 on a PC), `mock` |
+| `RS_SOURCE` | `mock` | `realsense` (robot, direct), `rosbridge` (old path), `mock` |
+| `RS_WIDTH` / `RS_HEIGHT` / `RS_FPS` | `640` / `480` / `30` | camera mode; `deploy.sh` sets `RS_FPS=15` |
+| `RS_HW_RESET` | – | `1` resets the camera before opening it (set automatically after a stall) |
 | `REALSENSE_ROSBRIDGE_HOST` / `_PORT` | `localhost` / `9091` | realsense_bridge address |
-| `YOLO_WEIGHTS` | `yolov8n.pt` | a `.engine` file (TensorRT) also works |
+| `YOLO_MODEL` / `YOLO_FORMAT` | `yolov8n` / `engine` | start model; a choice made with `POST /model` (saved in `models/selected.json`) wins |
+| `YOLO_WEIGHTS` | `yolov8n.pt` | fallback if the model manager fails |
+| `MODELS_DIR` | `./models` | TensorRT engine cache (a volume on the robot) |
 | `YOLO_DEVICE` | auto | `0` = Jetson GPU |
 | `YOLO_CONF` / `YOLO_IMGSZ` | `0.4` / `640` | |
 | `CAM_TX`, `CAM_TY`, `CAM_TZ`, `CAM_PITCH_DEG`, `CAM_YAW_DEG` | 0.30, 0, 0.10, 0, 0 | camera mount in the base frame |
@@ -219,7 +229,8 @@ The build context is `mission_control/` (see `CONVENTIONS.md`):
 ```bash
 docker build -f perception/Dockerfile -t nero_go2/perception .
 docker run -d --name nero_go2_perception --runtime nvidia --network host \
-  --restart unless-stopped -e RS_SOURCE=rosbridge -e YOLO_DEVICE=0 \
+  --restart unless-stopped --privileged -v /dev/bus/usb:/dev/bus/usb \
+  -e RS_SOURCE=realsense -e RS_FPS=15 -e OMP_NUM_THREADS=2 -e YOLO_DEVICE=0 \
   nero_go2/perception
 ```
 
@@ -238,8 +249,9 @@ tar cf - -C mission_control perception | plink -ssh -batch unitree@192.168.123.1
 
 Logs of follower state changes go to `/home/unitree/nero_go2_dev/perception/logs`.
 
-The container needs `realsense_bridge` with `align_depth:=true` and PNG depth
-(see `go2-hardware-bridge/realsense_bridge/Dockerfile`).
+With `RS_SOURCE=realsense` (the default of `deploy.sh`) the container owns
+the camera and `deploy.sh` stops `realsense_bridge`. `RS_SOURCE=rosbridge
+./deploy.sh` goes back to the old path and starts the bridge again.
 
 Debug page: `http://192.168.123.18:9112/`, which shows the annotated stream,
 the live JSON, and lock/release buttons.
@@ -308,7 +320,10 @@ rosbridge, or a lower color resolution with a supported depth mode.
 | `POST /follow/lock` `{"track_id": 3}` | lock; returns 409 if the id has no valid depth |
 | `POST /follow/release` | back to `IDLE`, mode `off` |
 | `POST /target` | legacy alias: an id = lock, `null` = release |
-| `GET /status` | health, `follow_state` |
+| `GET /status` | health, `follow_state`, `source`, `model`, `rate_hz`, `latency` (`p50_s`, `p90_s`, capture to result), `align_ms`, `infer_ms` |
+| `GET /models` | `current`, `available` (with `engine_ready` per imgsz), `imgsz_options`, `switch` (`idle`/`building`/`loading`/`error`) |
+| `POST /model` `{"id": "yolov8s", "format": "engine", "imgsz": 640}` | runtime switch, 202; 409 while a switch runs, 422 bad value. A switch restarts track ids, so a locked target is lost. |
+| `GET /system/power` | read only: `mode`, `cpu_online`, `cpu_total`, `cpu_freq_mhz`, `gpu_load_pct`, `switch_supported: false` |
 
 ## Tests
 
