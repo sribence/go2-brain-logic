@@ -65,18 +65,50 @@ def test_robust_depth_bbox_at_image_edge_does_not_crash():
 
 
 def test_smoother_rejects_single_frame_jump():
-    s = TrackSmoother(alpha=1.0)
-    for i in range(3):
+    s = TrackSmoother()
+    for i in range(5):
         s.update(1, 2.0, 0.0, 0.0, t=i * 0.1)
-    st = s.update(1, 6.0, 0.0, 0.0, t=0.4)                # bbox caught the wall
-    assert st.x == pytest.approx(2.0)
+    st = s.update(1, 6.0, 0.0, 0.0, t=0.5)                # bbox caught the wall
+    assert st.x == pytest.approx(2.0, abs=0.05)
+    assert st.last_t == pytest.approx(0.4)
+
+
+def test_smoother_accepts_persistent_jump():
+    s = TrackSmoother()
+    for i in range(5):
+        s.update(1, 2.0, 0.0, 0.0, t=i * 0.1)
+    for i in range(3):                                     # really moved (id reuse)
+        st = s.update(1, 5.0, 1.0, 0.0, t=0.5 + i * 0.1)
+    assert st.x == pytest.approx(5.0) and st.y == pytest.approx(1.0)
 
 
 def test_smoother_velocity_sign():
-    s = TrackSmoother(alpha=1.0, vel_alpha=1.0)
-    s.update(1, 2.0, 0.0, 0.0, t=0.0)
-    st = s.update(1, 2.1, 0.0, 0.0, t=0.1)                 # walking away 1 m/s
-    assert st.vx == pytest.approx(1.0)
+    s = TrackSmoother()
+    for i in range(20):                                    # walking away 1 m/s
+        st = s.update(1, 2.0 + 0.1 * i, 0.0, 0.0, t=i * 0.1)
+    assert st.vx == pytest.approx(1.0, abs=0.1)
+    assert abs(st.vy) < 0.1
+
+
+def test_smoother_reduces_depth_noise():
+    rng = np.random.default_rng(0)
+    s = TrackSmoother()
+    raw, filt = [], []
+    for i in range(100):                                   # standing still, 3 m
+        x = 3.0 + rng.normal(0, 0.1)
+        y = rng.normal(0, 0.03)
+        st = s.update(1, x, y, 0.0, t=i * 0.1)
+        if i >= 20:
+            raw.append(x)
+            filt.append(st.x)
+    assert np.std(filt) < 0.6 * np.std(raw)
+
+
+def test_smoother_follows_walking_person_without_lag():
+    s = TrackSmoother()
+    for i in range(30):                                    # 1 m/s sideways
+        st = s.update(1, 2.0, 0.1 * i, 0.0, t=i * 0.1)
+    assert st.y == pytest.approx(2.9, abs=0.1)
 
 
 def test_smoother_prunes_stale_tracks():

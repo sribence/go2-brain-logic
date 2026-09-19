@@ -112,47 +112,137 @@ class TrackState:
     last_t: float = 0.0
     first_t: float = 0.0
     hits: int = 1
+    rejects: int = 0            # consecutive gated-out measurements
+    kf_x: Optional[np.ndarray] = field(default=None, repr=False)   # [x y z vx vy vz]
+    kf_P: Optional[np.ndarray] = field(default=None, repr=False)
+    kf_t: float = 0.0           # time of the last predict
+
+
+@dataclass
+class KalmanConfig:
+    accel_std: float = 0.8          # m/s^2, how hard a person can change speed
+    range_std_base: float = 0.03    # m, depth noise at 0 m
+    range_std_quad: float = 0.015   # m/m^2, depth noise growth (RealSense ~ z^2)
+    lateral_std_base: float = 0.02  # m
+    lateral_std_lin: float = 0.01   # m/m
+    height_std: float = 0.08        # m, z of the torso window jumps with posture
+    init_vel_std: float = 1.0       # m/s, unknown walking speed at birth
+    gate_chi2: float = 16.27        # 3 dof, 99.9 %: Mahalanobis outlier gate
+    reinit_after: int = 3           # consecutive rejects = real jump, restart
+    min_hits_for_gate: int = 3
+
+    @classmethod
+    def from_env(cls, prefix: str = "KF_") -> "KalmanConfig":
+        import os
+        kw = {}
+        for name, f in cls.__dataclass_fields__.items():
+            raw = os.environ.get(prefix + name.upper())
+            if raw is not None:
+                kw[name] = type(f.default)(raw)
+        return cls(**kw)
 
 
 class TrackSmoother:
-    """Per-track-id EMA on base-frame position + velocity estimate.
+    """Per-track-id constant-velocity Kalman filter on base-frame position.
 
-    ByteTrack gives stable ids in 2D; this layer smooths the noisy depth
-    and rejects single-frame depth jumps (bbox briefly catching a wall).
+    ByteTrack gives stable ids in 2D; this layer filters the noisy depth.
+    State [x y z vx vy vz], white-noise acceleration model. The measurement
+    noise is anisotropic: along the camera ray (depth) it grows with the
+    square of the range, across the ray it grows linearly. So a far person
+    is trusted less in distance than in bearing, which matches how a stereo
+    depth camera fails.
+
+    A measurement outside the Mahalanobis gate (bbox briefly caught a wall)
+    is dropped and the track keeps its prediction. After `reinit_after`
+    consecutive rejects the jump is taken as real and the filter restarts
+    at the new position. `last_t` only moves on accepted measurements, so a
+    track that sees nothing but outliers still ages out.
     """
 
-    OUTLIER_JUMP_M = 1.5
-
-    def __init__(self, alpha: float = 0.5, vel_alpha: float = 0.3, max_age_s: float = 1.0):
-        self.alpha = alpha
-        self.vel_alpha = vel_alpha
+    def __init__(self, cfg: Optional[KalmanConfig] = None, max_age_s: float = 1.0):
+        self.cfg = cfg or KalmanConfig()
         self.max_age_s = max_age_s
         self._tracks: dict[int, TrackState] = {}
+
+    # -------------------------------------------------------------- filter
+
+    def _R(self, x: float, y: float) -> np.ndarray:
+        c = self.cfg
+        r = math.hypot(x, y)
+        sr = c.range_std_base + c.range_std_quad * r * r
+        sl = c.lateral_std_base + c.lateral_std_lin * r
+        th = math.atan2(y, x)
+        rot = np.array([[math.cos(th), -math.sin(th)], [math.sin(th), math.cos(th)]])
+        R = np.zeros((3, 3))
+        R[:2, :2] = rot @ np.diag([sr * sr, sl * sl]) @ rot.T
+        R[2, 2] = c.height_std ** 2
+        return R
+
+    def _init(self, s: TrackState, x: float, y: float, z: float, t: float) -> None:
+        s.kf_x = np.array([x, y, z, 0.0, 0.0, 0.0])
+        P = np.zeros((6, 6))
+        P[:3, :3] = self._R(x, y)
+        P[3:, 3:] = np.eye(3) * self.cfg.init_vel_std ** 2
+        s.kf_P = P
+        s.kf_t = t
+        s.rejects = 0
+        self._sync(s)
+
+    def _predict(self, s: TrackState, t: float) -> None:
+        dt = t - s.kf_t
+        if dt <= 0:
+            return
+        F = np.eye(6)
+        F[0, 3] = F[1, 4] = F[2, 5] = dt
+        g = np.array([0.5 * dt * dt, dt])
+        Q1 = np.outer(g, g) * self.cfg.accel_std ** 2     # per axis [pos, vel]
+        Q = np.zeros((6, 6))
+        for i in range(3):
+            Q[np.ix_([i, i + 3], [i, i + 3])] = Q1
+        s.kf_x = F @ s.kf_x
+        s.kf_P = F @ s.kf_P @ F.T + Q
+        s.kf_t = t
+
+    @staticmethod
+    def _sync(s: TrackState) -> None:
+        s.x, s.y, s.z = (float(v) for v in s.kf_x[:3])
+        s.vx, s.vy = float(s.kf_x[3]), float(s.kf_x[4])
+
+    # ----------------------------------------------------------------- API
 
     def update(self, track_id: int, x: float, y: float, z: float, t: float) -> TrackState:
         s = self._tracks.get(track_id)
         if s is None:
             s = TrackState(track_id, x, y, z, last_t=t, first_t=t)
+            self._init(s, x, y, z, t)
             self._tracks[track_id] = s
             return s
 
-        if s.hits >= 3 and math.hypot(x - s.x, y - s.y) > self.OUTLIER_JUMP_M:
-            return s  # keep last_t: a persistent jump ages out and re-acquires
+        self._predict(s, t)
+        innov = np.array([x, y, z]) - s.kf_x[:3]
+        S = s.kf_P[:3, :3] + self._R(x, y)
+        d2 = float(innov @ np.linalg.solve(S, innov))
 
-        dt = max(t - s.last_t, 1e-3)
-        a = self.alpha
-        px, py = s.x, s.y
-        s.x = a * x + (1 - a) * s.x
-        s.y = a * y + (1 - a) * s.y
-        s.z = a * z + (1 - a) * s.z
-        va = self.vel_alpha
-        s.vx = va * (s.x - px) / dt + (1 - va) * s.vx
-        s.vy = va * (s.y - py) / dt + (1 - va) * s.vy
+        if s.hits >= self.cfg.min_hits_for_gate and d2 > self.cfg.gate_chi2:
+            s.rejects += 1
+            if s.rejects >= self.cfg.reinit_after:
+                hits, first_t = s.hits, s.first_t
+                self._init(s, x, y, z, t)
+                s.hits, s.first_t, s.last_t = hits + 1, first_t, t
+                return s
+            self._sync(s)
+            return s  # keep last_t: a track of pure outliers ages out
+
+        K = s.kf_P[:, :3] @ np.linalg.inv(S)                # H = [I 0]
+        s.kf_x = s.kf_x + K @ innov
+        s.kf_P = s.kf_P - K @ s.kf_P[:3, :]
+        s.rejects = 0
         s.last_t = t
         s.hits += 1
+        self._sync(s)
         return s
 
-    def prune(self, t: float) -> list[int]:
+    def prune(self, t: float) -> list:
         dead = [tid for tid, s in self._tracks.items() if t - s.last_t > self.max_age_s]
         for tid in dead:
             del self._tracks[tid]

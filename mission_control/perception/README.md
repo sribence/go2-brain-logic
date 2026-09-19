@@ -44,7 +44,7 @@ RealSense D435i ──USB──> realsense_bridge (ROS1 Noetic, :9091 rosbridge)
                  │ roslibpy (localhost)
                  ▼
 perception (:9112)  YOLOv8 person + ByteTrack ─> torso depth ─> deproject
-                    ─> camera->base transform ─> per-track EMA + velocity
+                    ─> camera->base transform ─> per-track Kalman filter (position + velocity)
 ```
 
 The depth is aligned to the color image, so each color pixel has the matching
@@ -53,6 +53,22 @@ depth pixel. The distance comes from the "torso window" of the bbox (middle
 way the background between the legs and arms does not pull the distance
 back. A single-frame jump larger than 1.5 m (for example, the bbox catches a
 wall) is rejected by `TrackSmoother`.
+
+## Filtering
+
+Each track has a constant-velocity Kalman filter in the base frame
+(`geometry3d.TrackSmoother`, state `[x y z vx vy vz]`). The measurement noise
+follows the depth camera: along the camera ray it grows with the square of
+the distance, across the ray it grows linearly. A measurement outside the
+Mahalanobis gate (chi-square 16.27, 3 dof) is dropped as an outlier; three
+outliers in a row restart the filter at the new position. `position` and
+`velocity` are the filtered values, `position_raw` is the unfiltered one
+that the follower uses for jump detection. `bbox_smooth` is an EMA of the
+YOLO box, used only for drawing.
+
+Live measurement on 2026-09-19, a seated person at 2.04 m: position noise
+is about 1 cm before and after filtering. The filter matters for walking
+people and depth outliers, not for a still person.
 
 ## Coordinate frames
 
@@ -163,6 +179,8 @@ gate, the goal and the heading arrow.
 | `CORS_ORIGINS` | `*` | comma-separated origins allowed to call the API from a browser |
 | `MC_API_TOKEN` | – | if set, `POST /follow/*` and `/target` require the `X-MC-Token` header |
 | `FOLLOW_*` | see `FollowConfig` | follower tuning |
+| `KF_*` | see `KalmanConfig` | Kalman tuning, e.g. `KF_ACCEL_STD=0.8`, `KF_RANGE_STD_QUAD=0.015` |
+| `BBOX_SMOOTH_ALPHA` | `0.4` | EMA of the drawn box (display only) |
 
 ## Running on the robot
 

@@ -3,7 +3,7 @@
 YOLOv8 (class 0 = person) with ultralytics' built-in ByteTrack for stable
 2D track ids; each track gets a depth from the aligned depth image, is
 deprojected to the camera optical frame, transformed to the robot base
-frame and smoothed per track id (`geometry3d.TrackSmoother`).
+frame and filtered per track id (`geometry3d.TrackSmoother`, a Kalman filter).
 
 No robot I/O here -- the output is a plain dict consumed by `app.py`.
 Following (turning the target into velocity commands) is a separate,
@@ -12,12 +12,13 @@ later step and must go through the armed/E-stop checks in `core`.
 from __future__ import annotations
 
 import math
+import os
 import time
 from typing import Optional
 
 import numpy as np
 
-from geometry3d import Extrinsics, TrackSmoother, robust_bbox_depth
+from geometry3d import Extrinsics, KalmanConfig, TrackSmoother, robust_bbox_depth
 from rgbd_source import RGBDFrame
 
 PERSON_CLASS = 0
@@ -42,7 +43,9 @@ class PersonTracker:
         self.device = device
         self.imgsz = imgsz
         self.extrinsics = extrinsics or Extrinsics()
-        self.smoother = TrackSmoother(max_age_s=max_age_s)
+        self.smoother = TrackSmoother(KalmanConfig.from_env(), max_age_s=max_age_s)
+        self._bbox_ema: dict = {}           # track_id -> smoothed box, display only
+        self.bbox_alpha = float(os.environ.get("BBOX_SMOOTH_ALPHA", "0.4"))
 
     # ------------------------------------------------------------------ core
 
@@ -64,7 +67,8 @@ class PersonTracker:
             for (x1, y1, x2, y2), tid, c in zip(xyxy, ids, confs):
                 persons.append(self._localise(frame, int(tid), float(c), (x1, y1, x2, y2)))
 
-        self.smoother.prune(frame.t)
+        for tid in self.smoother.prune(frame.t):
+            self._bbox_ema.pop(tid, None)
         return {
             "t": frame.t,
             "infer_ms": round(infer_ms, 1),
@@ -73,6 +77,14 @@ class PersonTracker:
             "count": len(persons),
         }
 
+    def _smooth_bbox(self, tid: int, box) -> dict:
+        """EMA of the YOLO box for drawing; the raw box still feeds depth."""
+        new = np.array(box, dtype=float)
+        old = self._bbox_ema.get(tid)
+        cur = new if old is None else self.bbox_alpha * new + (1 - self.bbox_alpha) * old
+        self._bbox_ema[tid] = cur
+        return {k: round(float(v), 1) for k, v in zip(("x1", "y1", "x2", "y2"), cur)}
+
     def _localise(self, frame: RGBDFrame, tid: int, conf: float, bbox) -> dict:
         x1, y1, x2, y2 = (float(v) for v in bbox)
         z_m, u, v, ratio = robust_bbox_depth(frame.depth_mm, (x1, y1, x2, y2))
@@ -80,6 +92,7 @@ class PersonTracker:
             "track_id": tid,
             "confidence": round(conf, 3),
             "bbox": {"x1": round(x1, 1), "y1": round(y1, 1), "x2": round(x2, 1), "y2": round(y2, 1)},
+            "bbox_smooth": self._smooth_bbox(tid, (x1, y1, x2, y2)),
             "pixel": {"u": round(u, 1), "v": round(v, 1)},
             "depth_valid_ratio": round(ratio, 2),
             "depth_ok": z_m is not None,
@@ -134,7 +147,7 @@ def annotate(frame: RGBDFrame, result: dict) -> np.ndarray:
     tid_locked = follow.get("track_id")
 
     for p in result["persons"]:
-        b = p["bbox"]
+        b = p.get("bbox_smooth") or p["bbox"]
         is_target = p["track_id"] == tid_locked and state in ("ACQUIRING", "TRACKING")
         color = fcol if is_target else ((0, 220, 0) if p["depth_ok"] else (0, 160, 255))
         cv2.rectangle(img, (int(b["x1"]), int(b["y1"])), (int(b["x2"]), int(b["y2"])), color, 4 if is_target else 2)
