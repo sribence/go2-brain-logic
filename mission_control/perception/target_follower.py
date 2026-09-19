@@ -73,6 +73,7 @@ class FollowConfig:
 class TargetFollower:
     def __init__(self, cfg: Optional[FollowConfig] = None):
         self.cfg = cfg or FollowConfig()
+        self.hold = False    # operator/gesture pause: keep tracking, command zero
         self._reset(IDLE, "no target locked")
 
     # ------------------------------------------------------------------ API
@@ -255,7 +256,7 @@ class TargetFollower:
 
             vyaw = 0.0 if abs(math.degrees(bearing)) < cfg.yaw_deadband_deg else cfg.k_yaw * bearing
             vyaw = float(np.clip(vyaw, -cfg.max_vyaw, cfg.max_vyaw))
-            desired = np.array([vx, vyaw])
+            desired = np.zeros(2) if self.hold else np.array([vx, vyaw])
 
             step = max(dist - cfg.follow_distance_m, 0.0)
             goal = {

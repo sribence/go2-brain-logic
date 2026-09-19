@@ -164,6 +164,34 @@ The annotated stream shows the follow state, the reason, the command and
 the goal. A top-down radar in the bottom-right corner shows the people, the
 gate, the goal and the heading arrow.
 
+## Follow modes (`follow_modes.py`)
+
+The go2-console drives the follower through modes. `FollowSupervisor` wraps
+`TargetFollower` and holds the operator settings.
+
+| Mode | Behaviour |
+|---|---|
+| `off` | follower released, command zero |
+| `user_follow` | the operator locks one person with `/follow/lock`; never an automatic lock |
+| `intruder` | locks the nearest person with depth within 6 m automatically and raises an `intruder` alert; after `LOST` it may lock the next person only after 3 s |
+| `trick` | like `user_follow`, plus manual gestures |
+
+Settings (`POST /follow`, any subset):
+
+- `target_distance_m`: 1.0 to 4.0 m, sets `FollowConfig.follow_distance_m`.
+- `audio_alert`: alerts (`intruder`, `target_lost`) are always logged and
+  published on `mc.perception.alert`; with audio on, `AUDIO_ALERT_URL` is
+  also called when it is set.
+- `dry_run`: always `true` at start. `false` is refused with 403 unless the
+  container runs with `PERCEPTION_ALLOW_LIVE=1`. Even then the pillar sends
+  nothing to the robot: the flag only tells a separate executor that the
+  command may go to `mc_motion`.
+
+Gestures (`POST /follow/gesture`, trick mode only, 409 otherwise):
+`wave` plans `hello`, `stop` plans `sit` and holds the command at zero while
+tracking continues, `ok` resumes. Gesture recognition and action execution
+are not implemented yet: the response has `executed: false`.
+
 ## Environment variables
 
 | Variable | Default | Meaning |
@@ -179,6 +207,8 @@ gate, the goal and the heading arrow.
 | `CORS_ORIGINS` | `*` | comma-separated origins allowed to call the API from a browser |
 | `MC_API_TOKEN` | – | if set, `POST /follow/*` and `/target` require the `X-MC-Token` header |
 | `FOLLOW_*` | see `FollowConfig` | follower tuning |
+| `PERCEPTION_ALLOW_LIVE` | `0` | `1` allows `dry_run: false` |
+| `AUDIO_ALERT_URL` | empty | POSTed on alerts, `{kind}` is replaced |
 | `KF_*` | see `KalmanConfig` | Kalman tuning, e.g. `KF_ACCEL_STD=0.8`, `KF_RANGE_STD_QUAD=0.015` |
 | `BBOX_SMOOTH_ALPHA` | `0.4` | EMA of the drawn box (display only) |
 
@@ -235,15 +265,17 @@ the live JSON, and lock/release buttons.
 |---|---|
 | `GET /stream.mjpg`, `GET /frame.jpg` | annotated image with HUD and radar |
 | `GET /persons`, `GET /persons/stream` (SSE) | people + `follow` block, every frame |
-| `GET /follow` | latest `follow` block + active config |
+| `GET /follow` | flat UI block (`mode`, `target_distance_m`, `audio_alert`, `dry_run`, `live_allowed`, `hold`, `state`, `reason`, `target_id`, `command`, `target_dist_cm`, `goal`, `last_gesture`, `alerts`) + `follow` detail + `config` |
+| `POST /follow` | `{mode?, target_distance_m?, audio_alert?, dry_run?}`; 422 bad value, 403 live not allowed |
+| `POST /follow/gesture` `{"gesture": "wave"}` | trick mode only; planned action, not executed |
 | `POST /follow/lock` `{"track_id": 3}` | lock; returns 409 if the id has no valid depth |
-| `POST /follow/release` | back to `IDLE` |
+| `POST /follow/release` | back to `IDLE`, mode `off` |
 | `POST /target` | legacy alias: an id = lock, `null` = release |
 | `GET /status` | health, `follow_state` |
 
 ## Tests
 
 ```bash
-python -m pytest tests/test_perception_geometry.py tests/test_target_follower.py -q
+python -m pytest tests/test_perception_geometry.py tests/test_target_follower.py tests/test_follow_modes.py -q
 RS_SOURCE=mock python perception/app.py                      # full pipeline on a photo
 ```

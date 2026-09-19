@@ -2,8 +2,10 @@
 
 Person detection (YOLOv8) + tracking (ByteTrack) + 3D localisation from the
 Intel RealSense D435i aligned depth, plus a person follower that computes
-the velocity command it WOULD send (`target_follower.py`). READ-ONLY: this
-pillar never commands the robot -- every command is marked dry_run.
+the velocity command it WOULD send (`target_follower.py`), with operator
+modes on top (`follow_modes.py`). READ-ONLY: this pillar never commands the
+robot. `dry_run` is true unless PERCEPTION_ALLOW_LIVE=1, and even then it only
+marks the command as allowed for a separate executor.
 
 Endpoints:
     GET  /                    -- debug page (annotated stream + live JSON)
@@ -12,14 +14,17 @@ Endpoints:
     GET  /persons/stream      -- same, as Server-Sent Events
     GET  /frame.jpg           -- latest annotated frame
     GET  /stream.mjpg         -- annotated MJPEG stream
-    GET  /follow              -- follower state + dry-run command + config
+    GET  /follow              -- mode, settings, state, command (flat) + follower detail
+    POST /follow              -- {mode?, target_distance_m?, audio_alert?, dry_run?}
     POST /follow/lock         -- {"track_id": int}: lock ONE person to follow
-    POST /follow/release      -- drop the lock
+    POST /follow/release      -- drop the lock, mode -> off
+    POST /follow/gesture      -- {"gesture": "wave"|"stop"|"ok"}, trick mode only
     POST /target              -- legacy alias: {"track_id": int} = lock, null = release
 
 Redis (optional, best effort -- the pillar runs fine without it):
     mc.perception.persons     -- every processed frame
     mc.core.proximity_alert   -- nearest person closer than PROXIMITY_ALERT_M
+    mc.perception.alert       -- intruder locked / target lost (follow modes)
 """
 from __future__ import annotations
 
@@ -30,6 +35,7 @@ import os
 import secrets
 import threading
 import time
+import urllib.request
 from dataclasses import asdict
 from typing import Optional
 
@@ -44,6 +50,7 @@ import appearance
 from geometry3d import Extrinsics
 from person_tracker import PersonTracker, annotate
 from rgbd_source import RGBDFrame, make_source
+from follow_modes import FollowSupervisor, ModeError
 from target_follower import IDLE, FollowConfig, TargetFollower
 
 PILLAR = "perception"
@@ -60,6 +67,10 @@ YOLO_IMGSZ = int(os.environ.get("YOLO_IMGSZ", "640"))
 PROXIMITY_ALERT_M = float(os.environ.get("PROXIMITY_ALERT_M", "0.8"))
 PROXIMITY_ALERT_COOLDOWN_S = 2.0
 API_TOKEN = os.environ.get("MC_API_TOKEN", "")
+ALLOW_LIVE = os.environ.get("PERCEPTION_ALLOW_LIVE", "0") == "1"
+# Optional: GET/POST this URL on an alert when audio_alert is on, e.g.
+# http://127.0.0.1:8000/audio/play/{kind}  ({kind} = intruder | target_lost)
+AUDIO_ALERT_URL = os.environ.get("AUDIO_ALERT_URL", "")
 
 EXTRINSICS = Extrinsics(
     tx=float(os.environ.get("CAM_TX", "0.30")),
@@ -144,6 +155,7 @@ class Pipeline:
         self.tracker: Optional[PersonTracker] = None
         self.follow_cfg = FollowConfig.from_env()
         self.follower = TargetFollower(self.follow_cfg)
+        self.supervisor = FollowSupervisor(self.follower, allow_live=ALLOW_LIVE, on_alert=self._on_alert)
         self.follow_lock = threading.Lock()   # loop thread vs HTTP handlers
         self.bus = _Bus()
         self._last_alert = 0.0
@@ -184,7 +196,9 @@ class Pipeline:
                         for p in result["persons"] if p["depth_ok"]}
             with self.follow_lock:
                 prev_state = self.follower.state
+                self.supervisor.before_update(result["persons"], frame.t)
                 follow = self.follower.update(result["persons"], features, frame.t)
+                follow = self.supervisor.after_update(follow, frame.t)
             if follow["state"] != prev_state:
                 log_event("info", "follow state change", frm=prev_state, to=follow["state"],
                           reason=follow["reason"], track_id=follow["track_id"])
@@ -206,6 +220,14 @@ class Pipeline:
             log_event("warn", msg)
         self.last_error = msg
 
+    def _on_alert(self, alert: dict) -> None:
+        # Called from the loop thread under follow_lock: keep it non-blocking.
+        log_event("warn" if alert["kind"] == "intruder" else "info", "follow alert", **alert)
+        self.bus.publish("mc.perception.alert", alert)
+        if alert["audio"] and AUDIO_ALERT_URL:
+            url = AUDIO_ALERT_URL.format(kind=alert["kind"])
+            threading.Thread(target=_fire_and_forget, args=(url,), daemon=True).start()
+
     def _maybe_alert(self, result: dict) -> None:
         near = [p for p in result["persons"] if p["depth_ok"] and p["distance_m"] < PROXIMITY_ALERT_M]
         if not near or time.time() - self._last_alert < PROXIMITY_ALERT_COOLDOWN_S:
@@ -225,6 +247,13 @@ class Pipeline:
         with self.cond:
             self.cond.wait_for(lambda: self.seq != seq, timeout=timeout)
             return self.seq
+
+
+def _fire_and_forget(url: str) -> None:
+    try:
+        urllib.request.urlopen(urllib.request.Request(url, data=b"", method="POST"), timeout=3).read()
+    except Exception as exc:
+        logger.warning("audio alert %s failed: %s", url, exc)
 
 
 pipeline = Pipeline()
@@ -323,28 +352,80 @@ def _lock(track_id: int) -> dict:
         raise HTTPException(status_code=503, detail="no frame processed yet")
     try:
         with pipeline.follow_lock:
-            pipeline.follower.lock(track_id, result["persons"], result["t"])
+            pipeline.supervisor.lock(track_id, result["persons"], result["t"])
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     log_event("info", "follow lock", track_id=track_id)
-    return {"state": pipeline.follower.state, "track_id": track_id}
+    return {"state": pipeline.follower.state, "track_id": track_id, "mode": pipeline.supervisor.mode}
 
 
 def _release() -> dict:
     with pipeline.follow_lock:
-        pipeline.follower.release(time.time())
+        pipeline.supervisor.release(time.time())
     log_event("info", "follow release")
-    return {"state": pipeline.follower.state, "track_id": None}
+    return {"state": pipeline.follower.state, "track_id": None, "mode": "off"}
+
+
+def _follow_payload() -> dict:
+    result, _, _ = pipeline.snapshot()
+    follow = result.get("follow") if result else None
+    with pipeline.follow_lock:
+        flat = pipeline.supervisor.summary(follow)
+    return {
+        **flat,
+        "follow": follow,
+        "age_s": round(time.time() - result["t"], 3) if result else None,
+        "config": asdict(pipeline.follow_cfg),
+    }
+
+
+class FollowSettings(BaseModel):
+    mode: Optional[str] = None
+    target_distance_m: Optional[float] = None
+    audio_alert: Optional[bool] = None
+    dry_run: Optional[bool] = None
+
+
+class GestureCmd(BaseModel):
+    gesture: str
 
 
 @app.get("/follow")
 def follow_state():
-    result, _, _ = pipeline.snapshot()
-    return {
-        "follow": result.get("follow") if result else None,
-        "age_s": round(time.time() - result["t"], 3) if result else None,
-        "config": asdict(pipeline.follow_cfg),
-    }
+    return _follow_payload()
+
+
+@app.post("/follow", dependencies=[Depends(require_token)])
+def follow_settings(cmd: FollowSettings):
+    sup = pipeline.supervisor
+    try:
+        with pipeline.follow_lock:
+            # validate everything before changing anything
+            if cmd.dry_run is False and not sup.allow_live:
+                sup.set_dry_run(False)                       # raises 403
+            if cmd.target_distance_m is not None:
+                sup.set_distance(cmd.target_distance_m)
+            if cmd.mode is not None:
+                sup.set_mode(cmd.mode, time.time())
+            if cmd.audio_alert is not None:
+                sup.audio_alert = cmd.audio_alert
+            if cmd.dry_run is not None:
+                sup.set_dry_run(cmd.dry_run)
+    except ModeError as exc:
+        raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
+    log_event("info", "follow settings", **cmd.dict(exclude_none=True))
+    return _follow_payload()
+
+
+@app.post("/follow/gesture", dependencies=[Depends(require_token)])
+def follow_gesture(cmd: GestureCmd):
+    try:
+        with pipeline.follow_lock:
+            g = pipeline.supervisor.gesture(cmd.gesture, time.time())
+    except ModeError as exc:
+        raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
+    log_event("info", "follow gesture", **g)
+    return {"ok": True, **g}
 
 
 @app.post("/follow/lock", dependencies=[Depends(require_token)])
