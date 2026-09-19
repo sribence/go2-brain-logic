@@ -1,0 +1,6 @@
+# torch, ultralytics, opencv, numpy come from the base image.
+fastapi
+uvicorn
+roslibpy
+redis
+lap>=0.5.12

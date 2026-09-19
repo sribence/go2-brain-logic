@@ -34,6 +34,8 @@ konténer nélkül futtatja).
 | audio | 9107 |
 | blackbox | 9108 |
 | digital-twin (static viewer) | 9110 |
+| fleet | 9111 |
+| perception (person 3D tracking) | 9112 |
 | redis (event bus) | 6379 |
 | remote (tailscale) | nincs saját HTTP port |
 
@@ -54,10 +56,11 @@ for msg in pubsub.listen():
 ```
 
 Ismert csatornák (bővíthető):
-- `mc.core.proximity_alert` — a security/proximity logika publikálja (ember túl közel), az `audio` pillér erre iratkozik fel
+- `mc.core.proximity_alert` — a `perception` pillér publikálja (ember `PROXIMITY_ALERT_M`-nél közelebb), az `audio` pillér erre iratkozik fel
 - `mc.mapping.map_update` — mapping publikálja map-változáskor, a `navigation` és `digital-twin` erre iratkozik fel
 - `mc.core.anomaly` — bármelyik pillér publikálhat (akku, IMU-lökés, hő, folyamat-halál), a `blackbox` erre iratkozik fel és exportál
 - `mc.orchestration.task_event` — task indul/lép/kész/hiba
+- `mc.perception.persons` — perception publikálja minden feldolgozott képkockánál (emberek 3D pozíciója, track_id, target_id)
 
 ## Fájlszerkezet pillérenként
 
