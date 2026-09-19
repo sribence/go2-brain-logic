@@ -45,7 +45,7 @@ correct regardless, because they come from the camera. The absolute `z`
 ```json
 {
   "t": 1789813100.1, "seq": 812, "source": "rosbridge", "infer_ms": 14.2,
-  "count": 1, "target_id": 3, "target_mode": "nearest",
+  "count": 1, "target_id": 3, "target_mode": "locked",
   "persons": [{
     "track_id": 3, "confidence": 0.87,
     "bbox": {"x1": 210, "y1": 40, "x2": 380, "y2": 470},
@@ -53,15 +53,75 @@ correct regardless, because they come from the camera. The absolute `z`
     "position": {"x": 2.14, "y": 0.31, "z": 0.12},
     "velocity": {"vx": -0.05, "vy": 0.02},
     "distance_m": 2.162, "bearing_deg": 8.2, "age_s": 4.1, "hits": 38
-  }]
+  }],
+  "follow": {
+    "state": "TRACKING", "reason": "tracking", "track_id": 3,
+    "similarity": 0.91, "last_seen_age_s": 0.0,
+    "gate": {"x": 2.15, "y": 0.31, "radius_m": 0.7},
+    "target": {"track_id": 3, "position": {"x": 2.14, "y": 0.31, "z": 0.12}, "...": "..."},
+    "goal": {"x": 0.95, "y": 0.14, "yaw_deg": 8.2, "distance_m": 0.96, "distance_cm": 96},
+    "command": {"vx": 0.42, "vy": 0.0, "vyaw": 0.21, "vx_desired": 0.5,
+                "vyaw_desired": 0.21, "valid_until": 1789813100.6, "dry_run": true}
+  }
 }
 ```
 
-Target selection: `target_mode=nearest` picks the nearest person that has
-valid depth. `POST /target {"track_id": 3}` locks one person. If a locked
-person is lost, `target_id` becomes `null`. The pillar **never** switches to
-another person by itself. `{"track_id": null}` switches back to automatic
-mode.
+## Person following (dry run)
+
+`target_follower.py` follows **one locked person**. It computes the command
+it *would* send and puts it in every result under `follow`. It sends
+nothing to the robot: `command.dry_run` is always `true`.
+
+Identity is protected in two ways:
+
+1. **Spatial gate.** The target must be near its predicted position
+   (last position + velocity). The gate radius is `gate_base_m` plus
+   `max_person_speed` × time since last seen, up to `gate_max_m`. A move
+   that is faster than a person can walk is treated as a different person.
+2. **Appearance.** The first `acquire_frames` frames after the lock learn
+   HSV colour histograms of the upper and lower body (`appearance.py`).
+   The locked track must keep matching this template.
+
+| State | Meaning | Command |
+|---|---|---|
+| `IDLE` | no lock | 0 |
+| `ACQUIRING` | locked, learning the appearance | 0 |
+| `TRACKING` | target confirmed in this frame | computed |
+| `OCCLUDED` | target missing, jumped, or looks different | 0 |
+| `LOST` | occluded longer than `lost_timeout_s` | 0, needs a manual re-lock |
+
+In `OCCLUDED`, the follower takes back only a person who is inside the gate
+**and** matches the appearance, and only if exactly one person matches. This
+covers the case where ByteTrack gives the same person a new id. If two
+people match, it waits. It **never** selects someone else by itself.
+
+Limit: two people in similar clothes cannot be told apart by appearance.
+Then the gate is the only guard. The upgrade path is an OSNet ReID
+embedding behind the same `appearance.extract()/similarity()` interface.
+
+Command (`follow.command`) uses the units of the Go2 `Move(vx, vy, vyaw)`:
+m/s and rad/s, with `vyaw` > 0 = turn left. The command is a P controller
+on the distance error and the bearing, with these rules:
+
+- The speed ramps up (`max_accel`), but stopping is immediate.
+- The robot turns first: `vx` goes to 0 when the bearing reaches
+  `turn_first_deg`.
+- The robot never drives forward inside `min_safe_distance_m`.
+- Reverse is off by default.
+
+`follow.goal` is the point `follow_distance_m` in front of the person, in
+the base frame, with `distance_cm`.
+
+**Before live motion:** the executor must call `apply_ego_motion()` with the
+robot odometry. Without it, the gate stays where the person was and drifts
+off them. The executor must also drop any command after `valid_until`.
+
+Every `FollowConfig` field can be set as `FOLLOW_<FIELD>`, for example
+`FOLLOW_MAX_VX=0.3`. `GET /follow` returns the active config.
+
+The annotated stream shows the follow state, the reason, the command and
+the goal. A top-down radar in the bottom-right corner shows the people, the
+gate, the goal and the heading arrow.
 
 ## Environment variables
 
@@ -76,7 +136,8 @@ mode.
 | `PROXIMITY_ALERT_M` | `0.8` | below this distance, publishes `mc.core.proximity_alert` |
 | `REDIS_HOST` | – | if not set, there is no Redis publish |
 | `CORS_ORIGINS` | `*` | comma-separated origins allowed to call the API from a browser |
-| `MC_API_TOKEN` | – | if set, `POST /target` requires the `X-MC-Token` header |
+| `MC_API_TOKEN` | – | if set, `POST /follow/*` and `/target` require the `X-MC-Token` header |
+| `FOLLOW_*` | see `FollowConfig` | follower tuning |
 
 ## Running on the robot
 
@@ -93,11 +154,23 @@ The container needs `realsense_bridge` with `align_depth:=true` and PNG depth
 (see `go2-hardware-bridge/realsense_bridge/Dockerfile`).
 
 Debug page: `http://192.168.123.18:9112/`, which shows the annotated stream,
-the live JSON and target-lock buttons.
+the live JSON, and lock/release buttons.
+
+## Endpoints
+
+| Endpoint | Purpose |
+|---|---|
+| `GET /stream.mjpg`, `GET /frame.jpg` | annotated image with HUD and radar |
+| `GET /persons`, `GET /persons/stream` (SSE) | people + `follow` block, every frame |
+| `GET /follow` | latest `follow` block + active config |
+| `POST /follow/lock` `{"track_id": 3}` | lock; returns 409 if the id has no valid depth |
+| `POST /follow/release` | back to `IDLE` |
+| `POST /target` | legacy alias: an id = lock, `null` = release |
+| `GET /status` | health, `follow_state` |
 
 ## Tests
 
 ```bash
-python -m pytest tests/test_perception_geometry.py -q        # pure math, 12 tests
+python -m pytest tests/test_perception_geometry.py tests/test_target_follower.py -q
 RS_SOURCE=mock python perception/app.py                      # full pipeline on a photo
 ```

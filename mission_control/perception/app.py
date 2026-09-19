@@ -1,8 +1,9 @@
 """mission-control: perception pillar (port 9112).
 
 Person detection (YOLOv8) + tracking (ByteTrack) + 3D localisation from the
-Intel RealSense D435i aligned depth. READ-ONLY: never commands the robot.
-The follow behaviour will consume `/persons` or `mc.perception.persons`.
+Intel RealSense D435i aligned depth, plus a person follower that computes
+the velocity command it WOULD send (`target_follower.py`). READ-ONLY: this
+pillar never commands the robot -- every command is marked dry_run.
 
 Endpoints:
     GET  /                    -- debug page (annotated stream + live JSON)
@@ -11,7 +12,10 @@ Endpoints:
     GET  /persons/stream      -- same, as Server-Sent Events
     GET  /frame.jpg           -- latest annotated frame
     GET  /stream.mjpg         -- annotated MJPEG stream
-    POST /target              -- {"track_id": int|null}: lock / release target
+    GET  /follow              -- follower state + dry-run command + config
+    POST /follow/lock         -- {"track_id": int}: lock ONE person to follow
+    POST /follow/release      -- drop the lock
+    POST /target              -- legacy alias: {"track_id": int} = lock, null = release
 
 Redis (optional, best effort -- the pillar runs fine without it):
     mc.perception.persons     -- every processed frame
@@ -26,6 +30,7 @@ import os
 import secrets
 import threading
 import time
+from dataclasses import asdict
 from typing import Optional
 
 import cv2
@@ -35,9 +40,11 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel
 
+import appearance
 from geometry3d import Extrinsics
 from person_tracker import PersonTracker, annotate
 from rgbd_source import RGBDFrame, make_source
+from target_follower import IDLE, FollowConfig, TargetFollower
 
 PILLAR = "perception"
 PORT = int(os.environ.get("PERCEPTION_PORT", "9112"))
@@ -135,6 +142,9 @@ class Pipeline:
         self.source_name = os.environ.get("RS_SOURCE", "mock")
         self.last_error: Optional[str] = None
         self.tracker: Optional[PersonTracker] = None
+        self.follow_cfg = FollowConfig.from_env()
+        self.follower = TargetFollower(self.follow_cfg)
+        self.follow_lock = threading.Lock()   # loop thread vs HTTP handlers
         self.bus = _Bus()
         self._last_alert = 0.0
         self._stop = threading.Event()
@@ -170,6 +180,17 @@ class Pipeline:
             dt = time.time() - t0
             self.fps = 0.8 * self.fps + 0.2 * (1.0 / max(dt, 1e-3)) if self.fps else 1.0 / max(dt, 1e-3)
             result["source"] = source.name
+            features = {p["track_id"]: appearance.extract(frame.color_bgr, p["bbox"])
+                        for p in result["persons"] if p["depth_ok"]}
+            with self.follow_lock:
+                prev_state = self.follower.state
+                follow = self.follower.update(result["persons"], features, frame.t)
+            if follow["state"] != prev_state:
+                log_event("info", "follow state change", frm=prev_state, to=follow["state"],
+                          reason=follow["reason"], track_id=follow["track_id"])
+            result["follow"] = follow
+            result["target_id"] = follow["track_id"] if follow["state"] in ("ACQUIRING", "TRACKING") else None
+            result["target_mode"] = "none" if follow["state"] == IDLE else "locked"
             self.last_error = None
             with self.cond:
                 self.seq += 1
@@ -233,7 +254,7 @@ def status():
         "infer_ms": result["infer_ms"] if result else None,
         "result_age_s": round(time.time() - result["t"], 2) if result else None,
         "last_error": pipeline.last_error,
-        "target_lock": pipeline.tracker.locked_target if pipeline.tracker else None,
+        "follow_state": result["follow"]["state"] if result else None,
         "extrinsics": {"tx": EXTRINSICS.tx, "ty": EXTRINSICS.ty, "tz": EXTRINSICS.tz,
                        "pitch_deg": EXTRINSICS.pitch_deg, "yaw_deg": EXTRINSICS.yaw_deg},
     }
@@ -296,13 +317,52 @@ class TargetCmd(BaseModel):
     track_id: Optional[int] = None
 
 
+def _lock(track_id: int) -> dict:
+    result, _, _ = pipeline.snapshot()
+    if result is None:
+        raise HTTPException(status_code=503, detail="no frame processed yet")
+    try:
+        with pipeline.follow_lock:
+            pipeline.follower.lock(track_id, result["persons"], result["t"])
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    log_event("info", "follow lock", track_id=track_id)
+    return {"state": pipeline.follower.state, "track_id": track_id}
+
+
+def _release() -> dict:
+    with pipeline.follow_lock:
+        pipeline.follower.release(time.time())
+    log_event("info", "follow release")
+    return {"state": pipeline.follower.state, "track_id": None}
+
+
+@app.get("/follow")
+def follow_state():
+    result, _, _ = pipeline.snapshot()
+    return {
+        "follow": result.get("follow") if result else None,
+        "age_s": round(time.time() - result["t"], 3) if result else None,
+        "config": asdict(pipeline.follow_cfg),
+    }
+
+
+@app.post("/follow/lock", dependencies=[Depends(require_token)])
+def follow_lock(cmd: TargetCmd):
+    if cmd.track_id is None:
+        raise HTTPException(status_code=422, detail="track_id required (use /follow/release to unlock)")
+    return _lock(cmd.track_id)
+
+
+@app.post("/follow/release", dependencies=[Depends(require_token)])
+def follow_release():
+    return _release()
+
+
 @app.post("/target", dependencies=[Depends(require_token)])
 def set_target(cmd: TargetCmd):
-    if pipeline.tracker is None:
-        raise HTTPException(status_code=503, detail="model not loaded yet")
-    pipeline.tracker.lock_target(cmd.track_id)
-    log_event("info", "target lock changed", track_id=cmd.track_id)
-    return {"target_lock": cmd.track_id}
+    """Legacy alias kept for early UI code."""
+    return _release() if cmd.track_id is None else _lock(cmd.track_id)
 
 
 INDEX_HTML = """<!doctype html><html lang="hu"><meta charset="utf-8">
@@ -318,11 +378,13 @@ button{background:#2a2f3d;color:#dde;border:1px solid #444;border-radius:4px;pad
 <main><div><img src="stream.mjpg" alt="annotated stream"><div id="btns"></div></div><pre id="out">...</pre></main>
 <script>
 const out=document.getElementById('out'),btns=document.getElementById('btns');
-function lock(id){fetch('target',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({track_id:id})})}
+function post(u,b){return fetch(u,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b||{})}).then(r=>r.ok||r.json().then(j=>alert(j.detail)))}
+function lock(id){post('follow/lock',{track_id:id})}
 new EventSource('persons/stream').onmessage=e=>{
  const r=JSON.parse(e.data);out.textContent=JSON.stringify(r,null,1);
- btns.innerHTML='<button onclick="lock(null)">auto (legkozelebbi)</button>'+
-  r.persons.map(p=>`<button onclick="lock(${p.track_id})">#${p.track_id}${p.track_id===r.target_id?' *':''}</button>`).join('');
+ const f=r.follow||{};
+ btns.innerHTML=`<b>${f.state||''}</b> ${f.reason||''}<br><button onclick="post('follow/release')">elengedes</button>`+
+  r.persons.filter(p=>p.depth_ok).map(p=>`<button onclick="lock(${p.track_id})">kovetes #${p.track_id}${p.track_id===r.target_id?' *':''}</button>`).join('');
 };
 </script></html>"""
 

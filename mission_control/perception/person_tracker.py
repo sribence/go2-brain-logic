@@ -12,7 +12,6 @@ later step and must go through the armed/E-stop checks in `core`.
 from __future__ import annotations
 
 import math
-import threading
 import time
 from typing import Optional
 
@@ -44,19 +43,6 @@ class PersonTracker:
         self.imgsz = imgsz
         self.extrinsics = extrinsics or Extrinsics()
         self.smoother = TrackSmoother(max_age_s=max_age_s)
-        self._lock = threading.Lock()
-        self._locked_target: Optional[int] = None
-
-    # ------------------------------------------------------------------ target
-
-    def lock_target(self, track_id: Optional[int]) -> None:
-        """Lock following to one track id; None = auto (nearest person)."""
-        with self._lock:
-            self._locked_target = track_id
-
-    @property
-    def locked_target(self) -> Optional[int]:
-        return self._locked_target
 
     # ------------------------------------------------------------------ core
 
@@ -79,15 +65,12 @@ class PersonTracker:
                 persons.append(self._localise(frame, int(tid), float(c), (x1, y1, x2, y2)))
 
         self.smoother.prune(frame.t)
-        target_id = self._pick_target(persons)
         return {
             "t": frame.t,
             "infer_ms": round(infer_ms, 1),
             "image_size": [frame.intrinsics.width, frame.intrinsics.height],
             "persons": persons,
             "count": len(persons),
-            "target_id": target_id,
-            "target_mode": "locked" if self._locked_target is not None else "nearest",
         }
 
     def _localise(self, frame: RGBDFrame, tid: int, conf: float, bbox) -> dict:
@@ -101,6 +84,7 @@ class PersonTracker:
             "depth_valid_ratio": round(ratio, 2),
             "depth_ok": z_m is not None,
             "position_optical": None,
+            "position_raw": None,
             "position": None,
             "velocity": None,
             "distance_m": None,
@@ -114,7 +98,8 @@ class PersonTracker:
         s = self.smoother.update(tid, bx, by, bz, frame.t)
         person.update({
             "position_optical": _xyz(*p_opt),
-            "position": _xyz(s.x, s.y, s.z),
+            "position_raw": _xyz(bx, by, bz),      # unsmoothed: used for identity gating
+            "position": _xyz(s.x, s.y, s.z),       # smoothed: used for control
             "velocity": {"vx": round(s.vx, 3), "vy": round(s.vy, 3)},
             "distance_m": round(math.hypot(s.x, s.y), 3),
             "bearing_deg": round(math.degrees(math.atan2(s.y, s.x)), 1),
@@ -123,38 +108,100 @@ class PersonTracker:
         })
         return person
 
-    def _pick_target(self, persons: list[dict]) -> Optional[int]:
-        with_3d = [p for p in persons if p["depth_ok"]]
-        locked = self._locked_target
-        if locked is not None:
-            # Never silently switch to someone else: a lost locked target
-            # yields None so the follower stops instead of chasing a stranger.
-            return locked if any(p["track_id"] == locked for p in with_3d) else None
-        if not with_3d:
-            return None
-        return min(with_3d, key=lambda p: p["distance_m"])["track_id"]
-
 
 def _xyz(x: float, y: float, z: float) -> dict:
     return {"x": round(x, 3), "y": round(y, 3), "z": round(z, 3)}
 
 
+STATE_COLORS = {  # BGR
+    "IDLE": (160, 160, 160), "ACQUIRING": (0, 200, 255), "TRACKING": (255, 0, 255),
+    "OCCLUDED": (0, 140, 255), "LOST": (0, 0, 255),
+}
+
+
 def annotate(frame: RGBDFrame, result: dict) -> np.ndarray:
-    """Debug overlay: boxes, track ids, distance; target in magenta."""
+    """Debug overlay: boxes + ids + distance, follow HUD, top-down radar.
+
+    Locked target: thick box in the follow-state colour. Others: green
+    (with depth) / orange (no depth).
+    """
     import cv2
 
     img = frame.color_bgr.copy()
+    follow = result.get("follow") or {}
+    state = follow.get("state", "IDLE")
+    fcol = STATE_COLORS.get(state, (255, 255, 255))
+    tid_locked = follow.get("track_id")
+
     for p in result["persons"]:
         b = p["bbox"]
-        is_target = p["track_id"] == result["target_id"]
-        color = (255, 0, 255) if is_target else ((0, 220, 0) if p["depth_ok"] else (0, 160, 255))
-        cv2.rectangle(img, (int(b["x1"]), int(b["y1"])), (int(b["x2"]), int(b["y2"])), color, 2)
+        is_target = p["track_id"] == tid_locked and state in ("ACQUIRING", "TRACKING")
+        color = fcol if is_target else ((0, 220, 0) if p["depth_ok"] else (0, 160, 255))
+        cv2.rectangle(img, (int(b["x1"]), int(b["y1"])), (int(b["x2"]), int(b["y2"])), color, 4 if is_target else 2)
         label = f"#{p['track_id']}"
-        if p["depth_ok"]:
-            label += f" {p['distance_m']:.2f}m {p['bearing_deg']:+.0f}deg"
-        else:
-            label += " no depth"
-        cv2.putText(img, label, (int(b["x1"]), max(15, int(b["y1"]) - 6)),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2)
+        label += f" {p['distance_m']:.2f}m {p['bearing_deg']:+.0f}deg" if p["depth_ok"] else " no depth"
+        cv2.putText(img, label, (int(b["x1"]), max(15, int(b["y1"]) - 6)), cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2)
         cv2.circle(img, (int(p["pixel"]["u"]), int(p["pixel"]["v"])), 4, color, -1)
+
+    # --- HUD (top-left) ---
+    cmd = follow.get("command") or {}
+    goal = follow.get("goal")
+    lines = [f"{state}  #{tid_locked}" if tid_locked is not None else state, follow.get("reason", "")]
+    if cmd:
+        lines.append(f"vx {cmd['vx']:+.2f} m/s  vyaw {cmd['vyaw']:+.2f} rad/s  [DRY RUN]")
+    if goal:
+        lines.append(f"goal {goal['distance_cm']} cm @ {goal['yaw_deg']:+.0f} deg")
+    if follow.get("similarity") is not None:
+        lines.append(f"appearance {follow['similarity']:.2f}")
+    y = 22
+    for text in lines:
+        if not text:
+            continue
+        (w, h), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
+        cv2.rectangle(img, (6, y - h - 5), (14 + w, y + 5), (20, 20, 20), -1)
+        cv2.putText(img, text, (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, fcol, 1)
+        y += 22
+
+    _draw_radar(img, result, follow, fcol)
     return img
+
+
+def _draw_radar(img: np.ndarray, result: dict, follow: dict, fcol: tuple, size: int = 170, range_m: float = 6.0) -> None:
+    """Top-down inset, bottom-right: robot at bottom centre, x forward = up,
+    y left = left. Shows people, the identity gate, the goal point and the
+    commanded velocity arrow."""
+    import cv2
+
+    h_img, w_img = img.shape[:2]
+    ox, oy = w_img - size - 8, h_img - size - 8
+    roi = img[oy:oy + size, ox:ox + size]
+    roi[:] = (0.35 * roi).astype(np.uint8)
+    scale = (size - 20) / range_m
+    rx, ry = size // 2, size - 12
+
+    def px(x: float, y: float) -> tuple:
+        # Clamp to the inset so far-away people sit on the edge, not outside.
+        return (int(np.clip(rx - y * scale, 2, size - 3)), int(np.clip(ry - x * scale, 2, size - 3)))
+
+    for r in (1, 2, 3, 4, 5, 6):
+        cv2.circle(roi, (rx, ry), int(r * scale), (70, 70, 70), 1)
+    for p in result["persons"]:
+        if p["depth_ok"]:
+            col = fcol if p["track_id"] == follow.get("track_id") else (0, 220, 0)
+            cv2.circle(roi, px(p["position"]["x"], p["position"]["y"]), 5, col, -1)
+    gate = follow.get("gate")
+    if gate:
+        cv2.circle(roi, px(gate["x"], gate["y"]), max(2, int(gate["radius_m"] * scale)), fcol, 1)
+    goal = follow.get("goal")
+    if goal:
+        gx, gy = px(goal["x"], goal["y"])
+        cv2.drawMarker(roi, (gx, gy), (255, 255, 255), cv2.MARKER_CROSS, 10, 2)
+    cmd = follow.get("command") or {}
+    vx, vyaw = cmd.get("vx", 0.0), cmd.get("vyaw", 0.0)
+    if abs(vx) > 1e-3 or abs(vyaw) > 1e-3:
+        # Where the robot would head: length = 2 s at vx (min 0.3 m so a
+        # pure turn is still visible), angle = 1 s of vyaw.
+        length = max(2.0 * vx, 0.3)
+        tip = px(length * math.cos(vyaw), length * math.sin(vyaw))
+        cv2.arrowedLine(roi, (rx, ry), tip, (255, 255, 255), 2, tipLength=0.3)
+    cv2.rectangle(roi, (rx - 6, ry - 8), (rx + 6, ry + 8), (255, 255, 255), 1)
