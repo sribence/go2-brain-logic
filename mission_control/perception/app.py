@@ -31,6 +31,7 @@ from typing import Optional
 import cv2
 import uvicorn
 from fastapi import Depends, FastAPI, Header, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel
 
@@ -64,6 +65,14 @@ EXTRINSICS = Extrinsics(
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
 logger = logging.getLogger("perception")
 app = FastAPI(title="mission-control: perception")
+# The operator UIs (go2-console, web_dashboard) are served from other ports,
+# so fetch()/EventSource need CORS. Comma-separated origins, "*" = any.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[o.strip() for o in os.environ.get("CORS_ORIGINS", "*").split(",")],
+    allow_methods=["GET", "POST"],
+    allow_headers=["Content-Type", "X-MC-Token"],
+)
 
 
 def log_event(level: str, msg: str, **extra) -> None:

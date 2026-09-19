@@ -75,6 +75,7 @@ mode.
 | `CAM_TX`, `CAM_TY`, `CAM_TZ`, `CAM_PITCH_DEG`, `CAM_YAW_DEG` | 0.30, 0, 0.10, 0, 0 | camera mount in the base frame |
 | `PROXIMITY_ALERT_M` | `0.8` | below this distance, publishes `mc.core.proximity_alert` |
 | `REDIS_HOST` | – | if not set, there is no Redis publish |
+| `CORS_ORIGINS` | `*` | comma-separated origins allowed to call the API from a browser |
 | `MC_API_TOKEN` | – | if set, `POST /target` requires the `X-MC-Token` header |
 
 ## Running on the robot
