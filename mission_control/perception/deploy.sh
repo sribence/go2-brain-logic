@@ -10,6 +10,6 @@ docker build -t nero_go2/perception:latest -f ctx/perception/Dockerfile ctx 2>&1
 docker rm -f nero_go2_perception 2>/dev/null || true
 mkdir -p logs
 docker run -d --name nero_go2_perception --runtime nvidia --network host --restart unless-stopped \
-  -e RS_SOURCE=rosbridge -e YOLO_DEVICE=0 \
+  -e RS_SOURCE=rosbridge -e YOLO_DEVICE=0 -e PERCEPTION_ALLOW_LIVE="${PERCEPTION_ALLOW_LIVE:-0}" \
   -v "$ROOT/logs:/app/perception/logs" nero_go2/perception:latest
 echo "DEPLOY_DONE $(date)"

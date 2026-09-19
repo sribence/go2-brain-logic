@@ -17,6 +17,12 @@ Safety, all enforced here rather than in the caller:
     or a closed browser tab must not leave the last velocity latched)
   - /estop is unauthenticated and always answers: it can only make the robot
     safer, so nothing may stand between an operator and stopping it
+  - the Unitree remote wins: any stick deflection or button press on
+    rt/wirelesscontroller while armed disarms and stops (REMOTE_OVERRIDE=1).
+    Whether the firmware itself lets the remote beat SDK Move() is not
+    verified, so this makes it true for every caller of this service
+  - /odom republishes rt/sportmodestate (x, y, yaw) for ego-motion
+    compensation in the person follower
 """
 import math
 import os
@@ -33,6 +39,12 @@ MAX_VY = float(os.environ.get("MAX_VY", "0.3"))
 MAX_VYAW = float(os.environ.get("MAX_VYAW", "0.8"))
 COMMAND_TIMEOUT_S = float(os.environ.get("COMMAND_TIMEOUT_S", "0.5"))
 ARM_TIMEOUT_S = float(os.environ.get("ARM_TIMEOUT_S", "300"))
+REMOTE_OVERRIDE = os.environ.get("REMOTE_OVERRIDE", "1") == "1"
+REMOTE_DEADZONE = float(os.environ.get("REMOTE_DEADZONE", "0.15"))
+# 1 = refuse /arm unless the remote was heard within REMOTE_MAX_AGE_S. Only
+# useful if the remote publishes while idle; check /health "remote" first.
+REQUIRE_REMOTE = os.environ.get("REQUIRE_REMOTE", "0") == "1"
+REMOTE_MAX_AGE_S = float(os.environ.get("REMOTE_MAX_AGE_S", "1.0"))
 
 app = Flask(__name__)
 
@@ -45,6 +57,11 @@ _last_cmd_t = 0.0
 _last_cmd = (0.0, 0.0, 0.0)
 _watchdog_trips = 0
 _events = []
+_odom = None            # (x, y, yaw, t) from rt/sportmodestate
+_remote_t = 0.0         # last rt/wirelesscontroller message
+_remote_msgs = 0
+_remote_overrides = 0
+_subs = []              # keep DDS subscribers alive
 
 
 def _log(level, msg, **extra):
@@ -72,6 +89,56 @@ def _init_sdk():
         with _lock:
             _sdk_error = str(exc)[:200]
         _log("error", f"SportClient nem indult: {exc}")
+        return
+    _init_subscribers()
+
+
+def _init_subscribers():
+    try:
+        from unitree_sdk2py.core.channel import ChannelSubscriber
+        from unitree_sdk2py.idl.unitree_go.msg.dds_ import SportModeState_, WirelessController_
+
+        a = ChannelSubscriber("rt/sportmodestate", SportModeState_)
+        a.Init(_on_sport_state, 10)
+        b = ChannelSubscriber("rt/wirelesscontroller", WirelessController_)
+        b.Init(_on_remote, 10)
+        _subs.extend([a, b])
+        _log("info", "DDS feliratkozas: sportmodestate + wirelesscontroller")
+    except Exception as exc:
+        _log("error", f"DDS feliratkozas sikertelen: {exc}")
+
+
+def _on_sport_state(msg):
+    global _odom
+    _odom = (float(msg.position[0]), float(msg.position[1]), float(msg.imu_state.rpy[2]), time.time())
+
+
+def _on_remote(msg):
+    """Runs on the DDS thread. Any operator input on the remote while armed
+    disarms: the person holding the remote must always win."""
+    global _remote_t, _remote_msgs, _armed, _last_cmd_t, _remote_overrides
+    _remote_t = time.time()
+    _remote_msgs += 1
+    if not REMOTE_OVERRIDE:
+        return
+    axes = (msg.lx, msg.ly, msg.rx, msg.ry)
+    active = msg.keys != 0 or any(abs(a) > REMOTE_DEADZONE for a in axes)
+    if not active:
+        return
+    with _lock:
+        was_armed = _armed
+        _armed = False
+        _last_cmd_t = 0.0
+        if was_armed:
+            _remote_overrides += 1
+    if was_armed:
+        _stop_now("remote override")
+        _log("error", f"TAVIRANYITO felulirta: lezarva (keys={msg.keys}, "
+                      f"axes={[round(a, 2) for a in axes]})")
+
+
+def _remote_age():
+    return None if not _remote_t else round(time.time() - _remote_t, 2)
 
 
 def _clamp(v, limit):
@@ -136,7 +203,19 @@ def health():
                         # bare 409 mid-drive learns nothing from it.
                         "arm_timeout_s": ARM_TIMEOUT_S,
                         "armed_for_s": round(time.time() - _armed_t, 1) if _armed else None,
-                        "watchdog_trips": _watchdog_trips})
+                        "watchdog_trips": _watchdog_trips,
+                        "remote": {"override": REMOTE_OVERRIDE, "required": REQUIRE_REMOTE,
+                                   "msgs": _remote_msgs, "age_s": _remote_age(),
+                                   "overrides": _remote_overrides},
+                        "odom_age_s": None if _odom is None else round(time.time() - _odom[3], 2)})
+
+
+@app.route("/odom")
+def odom():
+    o = _odom
+    if o is None:
+        return jsonify({"error": "nincs sportmodestate"}), 503
+    return jsonify({"x": o[0], "y": o[1], "yaw": o[2], "t": o[3], "age_s": round(time.time() - o[3], 3)})
 
 
 @app.route("/status")
@@ -157,6 +236,8 @@ def arm():
     with _lock:
         if want and _sport is None:
             return jsonify({"error": f"SportClient nem elerheto: {_sdk_error}"}), 503
+        if want and REQUIRE_REMOTE and (not _remote_t or time.time() - _remote_t > REMOTE_MAX_AGE_S):
+            return jsonify({"error": "a taviranyito nem kuld adatot -- kapcsold be"}), 409
         _armed = want
         _armed_t = time.time()
     if not want:

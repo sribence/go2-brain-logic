@@ -19,6 +19,7 @@ Endpoints:
     POST /follow/lock         -- {"track_id": int}: lock ONE person to follow
     POST /follow/release      -- drop the lock, mode -> off
     POST /follow/gesture      -- {"gesture": "wave"|"stop"|"ok"}, trick mode only
+    POST /follow/ego          -- {dx, dy, dyaw}: robot motion from odometry
     POST /target              -- legacy alias: {"track_id": int} = lock, null = release
 
 Redis (optional, best effort -- the pillar runs fine without it):
@@ -415,6 +416,22 @@ def follow_settings(cmd: FollowSettings):
         raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
     log_event("info", "follow settings", **cmd.dict(exclude_none=True))
     return _follow_payload()
+
+
+class EgoCmd(BaseModel):
+    dx: float
+    dy: float
+    dyaw: float
+
+
+@app.post("/follow/ego", dependencies=[Depends(require_token)])
+def follow_ego(cmd: EgoCmd):
+    """Robot motion since the last call, in the previous base frame (from
+    odometry). Sent by the follow executor so the gate stays on the person
+    while the robot turns or walks."""
+    with pipeline.follow_lock:
+        pipeline.follower.apply_ego_motion(cmd.dx, cmd.dy, cmd.dyaw)
+    return {"ok": True}
 
 
 @app.post("/follow/gesture", dependencies=[Depends(require_token)])
