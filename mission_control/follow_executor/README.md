@@ -28,7 +28,7 @@ the Kalman tracks into the new robot frame.
 |---|---|---|
 | `EXEC_MAX_VX` | `0.0` | forward limit (stage 1 = turn only) |
 | `EXEC_MAX_VYAW` | `0.4` | turn limit, rad/s |
-| `MAX_RESULT_AGE_S` | `0.4` | oldest follower result accepted |
+| `MAX_RESULT_AGE_S` | `0.4` | oldest follower result accepted. The age counts from camera capture, so it includes the camera pipeline latency (1.0-1.2 s on the robot, 2026-09-19). The robot runs with 1.5. |
 | `RATE_HZ` | `10` | loop rate |
 | `PERCEPTION_URL`, `MOTION_URL` | `127.0.0.1:9112`, `:9102` | services |
 
@@ -45,7 +45,7 @@ so it never starts on its own after a reboot.
 
 ```bash
 docker run -d --name nero_go2_follow_executor --network host --restart no \
-  -e EXEC_MAX_VX=0.0 -e EXEC_MAX_VYAW=0.6 -e MAX_RESULT_AGE_S=0.8 \
+  -e EXEC_MAX_VX=0.0 -e EXEC_MAX_VYAW=0.6 -e MAX_RESULT_AGE_S=1.5 \
   -v /home/unitree/nero_go2_dev/follow_executor:/exec:ro \
   nero_go2/web_dashboard:latest python /exec/executor.py
 ```
