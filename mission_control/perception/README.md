@@ -5,9 +5,34 @@ and computes the 3D position of each person from the aligned depth image of
 the Intel RealSense D435i. The pillar runs **on the robot** (Jetson Orin NX,
 CUDA) in its own Docker container.
 
-The pillar is **read-only**: it never sends a command to the robot. The
-follow behaviour will be a separate step that consumes `/persons`, and it
-must go through `core` (armed check, watchdog, E-stop).
+The pillar is **read-only**: it never sends a command to the robot. It
+contains a person follower that computes the `Move(vx, vy, vyaw)` command it
+*would* send, but every command is marked `dry_run: true` and only shown on
+the HUD, the radar and the JSON output. A live executor is a later step, and
+it must go through `core` (armed check, watchdog, E-stop).
+
+## Status (2026-09-19)
+
+Deployed and running on the Go2 Jetson (`192.168.123.18`):
+
+| Item | Value |
+|---|---|
+| Container | `nero_go2_perception`, `--runtime nvidia --network host --restart unless-stopped` |
+| Base image | `ultralytics/ultralytics:latest-jetson-jetpack5` (13.7 GB, Python 3.8, torch 2.1 with CUDA) |
+| Source | `RS_SOURCE=rosbridge`, the `realsense_bridge` container on `localhost:9091` |
+| Model | `yolov8n.pt` on GPU (`YOLO_DEVICE=0`) |
+| Measured | loop about 17 fps, inference about 78 ms per frame |
+| Camera | color 640x480 at 15 Hz, aligned depth about 10 Hz (16-bit PNG) |
+| Follower | dry run only, no motion command leaves the container |
+
+Open items:
+
+- The camera mount extrinsics (`CAM_*`) are not measured yet. The defaults
+  (`tx=0.30`, `tz=0.10`, no pitch or yaw) can put positions a few cm off.
+- TensorRT export (`yolov8n.engine`) for faster inference.
+- Live executor through `core`, which uses `apply_ego_motion()` with odometry
+  and honours `command.valid_until`. It needs explicit approval before any
+  test on the real robot.
 
 ## Data flow
 
@@ -150,11 +175,41 @@ docker run -d --name nero_go2_perception --runtime nvidia --network host \
   nero_go2/perception
 ```
 
+Or use `deploy.sh`: copy this folder (with `CONVENTIONS.md`'s build context
+layout) to `/home/unitree/nero_go2_dev/perception/ctx/` on the robot, then:
+
+```bash
+bash /home/unitree/nero_go2_dev/perception/deploy.sh
+```
+
+From a Windows PC on the robot network (SSH with `plink`, `scp` is blocked):
+
+```bash
+tar cf - -C mission_control perception | plink -ssh -batch unitree@192.168.123.18 "mkdir -p ~/nero_go2_dev/perception/ctx && tar xf - -C ~/nero_go2_dev/perception/ctx"
+```
+
+Logs of follower state changes go to `/home/unitree/nero_go2_dev/perception/logs`.
+
 The container needs `realsense_bridge` with `align_depth:=true` and PNG depth
 (see `go2-hardware-bridge/realsense_bridge/Dockerfile`).
 
 Debug page: `http://192.168.123.18:9112/`, which shows the annotated stream,
 the live JSON, and lock/release buttons.
+
+## Live dry-run test
+
+1. Open `http://192.168.123.18:9112/`.
+2. Let one person stand in front of the camera and wait for the `#N` box.
+3. Press "kovetes #N". The state goes `ACQUIRING`, then `TRACKING` after
+   `acquire_frames` frames.
+4. Watch the HUD (state, reason, `vx`/`vyaw` with `[DRY RUN]`, goal in cm) and
+   the radar (gate circle, goal cross, heading arrow).
+5. Check these cases:
+   - the person jumps fast: `OCCLUDED` with "jump", command zero;
+   - the person is hidden: `OCCLUDED`, a search inside the gate;
+   - another person steps in: no switch to the other person;
+   - the person is gone for `lost_timeout` (2 s): `LOST`.
+6. Press "elengedes" to return to `IDLE`.
 
 ## Endpoints
 
