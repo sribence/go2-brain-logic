@@ -34,10 +34,14 @@ class PersonTracker:
         device: Optional[str] = None,
         imgsz: int = 640,
         max_age_s: float = 1.0,
+        model: Optional[object] = None,
+        half: bool = False,
     ):
-        from ultralytics import YOLO
-
-        self.model = YOLO(weights)
+        if model is None:
+            from ultralytics import YOLO
+            model = YOLO(weights)
+        self.model = model
+        self.half = half
         self.conf = conf
         self.tracker_cfg = tracker_cfg
         self.device = device
@@ -46,6 +50,12 @@ class PersonTracker:
         self.smoother = TrackSmoother(KalmanConfig.from_env(), max_age_s=max_age_s)
         self._bbox_ema: dict = {}           # track_id -> smoothed box, display only
         self.bbox_alpha = float(os.environ.get("BBOX_SMOOTH_ALPHA", "0.4"))
+
+    def set_model(self, model, imgsz: int, half: bool = False) -> None:
+        """Swap the detector between two frames (called from the model switch
+        thread; the loop reads `self.model` once per frame). ByteTrack state
+        lives in the old model's predictor, so track ids restart."""
+        self.model, self.imgsz, self.half = model, imgsz, half
 
     # ------------------------------------------------------------------ core
 

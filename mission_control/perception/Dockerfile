@@ -17,6 +17,8 @@ COPY perception/ /app/perception/
 ENV PYTHONPATH=/app/perception
 WORKDIR /app/perception
 # Model weights are baked in so the robot needs no internet at start.
-RUN python3 -c "from ultralytics import YOLO; YOLO('yolov8n.pt')"
+# The TensorRT engines are built on the robot (GPU needed) into the models volume.
+RUN pip install --no-cache-dir "onnx>=1.12,<1.18" onnxslim || true
+RUN python3 -c "from ultralytics import YOLO; [YOLO(m + '.pt') for m in ('yolov8n', 'yolov8s', 'yolo11n', 'yolo11s')]"
 EXPOSE 9112
 CMD ["python3", "app.py"]

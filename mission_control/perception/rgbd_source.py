@@ -3,10 +3,12 @@
 All sources return `RGBDFrame`: BGR color + uint16 depth in millimetres,
 ALIGNED to the color image (same HxW, same intrinsics).
 
-  RS_SOURCE=realsense  -- pyrealsense2 directly (dev PC / x86 container with
-                          USB passthrough). No ARM64 wheel on the Jetson.
+  RS_SOURCE=realsense  -- pyrealsense2 directly (USB passthrough). The Jetson
+                          path since 2026-09-20: the aarch64 wheel exists
+                          (2.55.1) and this cuts ~0.8 s of latency.
   RS_SOURCE=rosbridge  -- reads `go2-hardware-bridge/realsense_bridge`
-                          (ROS1 Noetic + rosbridge :9091). The Jetson path.
+                          (ROS1 Noetic + rosbridge :9091). Old path, slow:
+                          JPEG/PNG + base64 JSON adds 0.5-0.9 s.
   RS_SOURCE=mock       -- static image + synthetic moving depth plane, so the
                           whole pipeline runs with no camera at all.
 """
@@ -49,9 +51,20 @@ class RGBDSource(abc.ABC):
 
 
 class RealSenseSource(RGBDSource):
+    """pyrealsense2 directly on the camera. The low-latency path on the Jetson.
+
+    A grab thread keeps only the newest frameset, so `read()` never serves a
+    queued, old frame. Alignment runs in `read()`, only for frames the loop
+    actually processes. Frame time is the camera capture time in the host
+    clock (global time), so latency figures and staleness gates see the real
+    age of the image.
+
+    Needs the USB device in the container (`--privileged -v /dev/bus/usb:/dev/bus/usb`)
+    and no other process holding the camera (stop realsense_bridge).
+    """
     name = "realsense"
 
-    def __init__(self, width: int = 640, height: int = 480, fps: int = 15):
+    def __init__(self, width: int = 640, height: int = 480, fps: int = 30):
         import pyrealsense2 as rs
 
         self._rs = rs
@@ -60,28 +73,73 @@ class RealSenseSource(RGBDSource):
         cfg.enable_stream(rs.stream.color, width, height, rs.format.bgr8, fps)
         cfg.enable_stream(rs.stream.depth, width, height, rs.format.z16, fps)
         profile = self._pipe.start(cfg)
+        dev = profile.get_device()
+        for sensor in dev.query_sensors():
+            if sensor.supports(rs.option.global_time_enabled):
+                sensor.set_option(rs.option.global_time_enabled, 1)
+            # Keep the frame rate in low light: otherwise auto exposure may
+            # stretch frames and add up to ~100 ms of latency.
+            if sensor.supports(rs.option.auto_exposure_priority):
+                sensor.set_option(rs.option.auto_exposure_priority, 0)
         self._align = rs.align(rs.stream.color)
-        self._depth_scale_mm = profile.get_device().first_depth_sensor().get_depth_scale() * 1000.0
+        self._depth_scale_mm = dev.first_depth_sensor().get_depth_scale() * 1000.0
         i = profile.get_stream(rs.stream.color).as_video_stream_profile().get_intrinsics()
         self._intr = Intrinsics(i.width, i.height, i.fx, i.fy, i.ppx, i.ppy)
+        self._cond = threading.Condition()
+        self._latest = None          # (frameset, arrival time)
+        self._served = None
+        self._stop = threading.Event()
+        self.align_ms = 0.0
+        self._thread = threading.Thread(target=self._grab, daemon=True, name="rs-grab")
+        self._thread.start()
         logger.info("realsense started %dx%d@%d, depth_scale=%.4f mm", width, height, fps, self._depth_scale_mm)
 
+    def _grab(self) -> None:
+        while not self._stop.is_set():
+            try:
+                fs = self._pipe.wait_for_frames(2000)
+            except RuntimeError as exc:
+                logger.warning("realsense wait_for_frames: %s", exc)
+                continue
+            fs.keep()
+            with self._cond:
+                self._latest = (fs, time.time())
+                self._cond.notify_all()
+
+    def _capture_time(self, frame, arrival: float) -> float:
+        rs = self._rs
+        if frame.get_frame_timestamp_domain() == rs.timestamp_domain.global_time:
+            t = frame.get_timestamp() / 1000.0
+            if 0 <= arrival - t < 2:
+                return t
+        return arrival
+
     def read(self, timeout_s: float = 1.0) -> Optional[RGBDFrame]:
-        try:
-            frames = self._pipe.wait_for_frames(int(timeout_s * 1000))
-        except RuntimeError:
-            return None
-        frames = self._align.process(frames)
+        with self._cond:
+            if not self._cond.wait_for(lambda: self._latest is not None and self._latest is not self._served,
+                                       timeout=timeout_s):
+                return None
+            self._served = latest = self._latest
+        fs, arrival = latest
+        t0 = time.time()
+        frames = self._align.process(fs)
         c, d = frames.get_color_frame(), frames.get_depth_frame()
         if not c or not d:
             return None
         depth = np.asanyarray(d.get_data())
         if abs(self._depth_scale_mm - 1.0) > 1e-6:  # D435 default is exactly 1 mm
             depth = (depth.astype(np.float32) * self._depth_scale_mm).astype(np.uint16)
-        return RGBDFrame(np.asanyarray(c.get_data()).copy(), depth.copy(), self._intr, time.time())
+        color = np.asanyarray(c.get_data()).copy()
+        depth = depth.copy()
+        self.align_ms = (time.time() - t0) * 1000.0
+        return RGBDFrame(color, depth, self._intr, self._capture_time(c, arrival))
 
     def close(self) -> None:
-        self._pipe.stop()
+        self._stop.set()
+        try:
+            self._pipe.stop()
+        except RuntimeError:
+            pass
 
 
 class RosbridgeSource(RGBDSource):
@@ -217,7 +275,7 @@ def make_source() -> RGBDSource:
         return RealSenseSource(
             int(os.environ.get("RS_WIDTH", "640")),
             int(os.environ.get("RS_HEIGHT", "480")),
-            int(os.environ.get("RS_FPS", "15")),
+            int(os.environ.get("RS_FPS", "30")),
         )
     if kind == "rosbridge":
         return RosbridgeSource(

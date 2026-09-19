@@ -37,6 +37,7 @@ import secrets
 import threading
 import time
 import urllib.request
+from collections import deque
 from dataclasses import asdict
 from typing import Optional
 
@@ -49,7 +50,9 @@ from pydantic import BaseModel
 
 import appearance
 from geometry3d import Extrinsics
+from model_manager import ModelManager, ModelSwitchError
 from person_tracker import PersonTracker, annotate
+import system_info
 from rgbd_source import RGBDFrame, make_source
 from follow_modes import FollowSupervisor, ModeError
 from target_follower import IDLE, FollowConfig, TargetFollower
@@ -65,6 +68,10 @@ YOLO_WEIGHTS = os.environ.get("YOLO_WEIGHTS", "yolov8n.pt")
 YOLO_CONF = float(os.environ.get("YOLO_CONF", "0.4"))
 YOLO_DEVICE = os.environ.get("YOLO_DEVICE") or None   # "0" = first CUDA GPU
 YOLO_IMGSZ = int(os.environ.get("YOLO_IMGSZ", "640"))
+# Default model at start: FP16 TensorRT engine (built on first start, cached
+# in the models volume). A choice made with POST /model overrides it.
+YOLO_MODEL = os.environ.get("YOLO_MODEL", "yolov8n")
+YOLO_FORMAT = os.environ.get("YOLO_FORMAT", "engine")
 PROXIMITY_ALERT_M = float(os.environ.get("PROXIMITY_ALERT_M", "0.8"))
 PROXIMITY_ALERT_COOLDOWN_S = 2.0
 API_TOKEN = os.environ.get("MC_API_TOKEN", "")
@@ -161,17 +168,53 @@ class Pipeline:
         self.bus = _Bus()
         self._last_alert = 0.0
         self._stop = threading.Event()
+        self.latency = deque(maxlen=50)      # capture -> result, seconds
+        self.done_at = deque(maxlen=30)      # result times, for the real loop rate
+        self.source: Optional[object] = None
+
+    def _apply_model(self, model, spec: dict) -> None:
+        half = spec["format"] == "pt" and bool(YOLO_DEVICE)
+        self.tracker.set_model(model, spec["imgsz"], half=half)
+        log_event("info", "model switched", **spec)
+
+    def latency_stats(self) -> dict:
+        v = sorted(self.latency)
+        if not v:
+            return {"p50_s": None, "p90_s": None, "window": 0}
+        return {"p50_s": round(v[len(v) // 2], 3), "p90_s": round(v[int(len(v) * 0.9)], 3), "window": len(v)}
+
+    def rate_hz(self) -> float:
+        d = self.done_at
+        return round((len(d) - 1) / (d[-1] - d[0]), 1) if len(d) > 2 and d[-1] > d[0] else 0.0
 
     def start(self) -> None:
         threading.Thread(target=self._run, daemon=True, name="perception-loop").start()
 
     def _run(self) -> None:
-        self.tracker = PersonTracker(YOLO_WEIGHTS, YOLO_CONF, EXTRINSICS, device=YOLO_DEVICE, imgsz=YOLO_IMGSZ)
+        self.models = ModelManager(YOLO_DEVICE, apply=self._apply_model)
+        wanted = self.models.saved_choice({"id": YOLO_MODEL, "format": YOLO_FORMAT, "imgsz": YOLO_IMGSZ})
+        try:
+            model, loaded = self.models.load_now(wanted)
+        except Exception as exc:
+            logger.exception("model load failed, falling back to %s", YOLO_WEIGHTS)
+            self._fail(f"model load failed: {exc}")
+            loaded = {"id": YOLO_WEIGHTS.replace(".pt", ""), "format": "pt", "imgsz": YOLO_IMGSZ}
+            model = None
+        half = loaded["format"] == "pt" and bool(YOLO_DEVICE)
+        self.tracker = PersonTracker(YOLO_WEIGHTS, YOLO_CONF, EXTRINSICS, device=YOLO_DEVICE,
+                                     imgsz=loaded["imgsz"], model=model, half=half)
+        self.models.current = dict(loaded, half=half or loaded["format"] == "engine")
+        if loaded != wanted:   # engine not cached yet: build it while the .pt model runs
+            try:
+                self.models.request(wanted["id"], wanted["format"], wanted["imgsz"])
+            except ModelSwitchError as exc:
+                logger.warning("engine auto-build not started: %s", exc)
         source = None
         while not self._stop.is_set():
             if source is None:
                 try:
                     source = make_source()
+                    self.source = source
                     self.source_name = source.name
                     self.last_error = None
                     log_event("info", "rgbd source opened", source=source.name)
@@ -207,6 +250,9 @@ class Pipeline:
             result["target_id"] = follow["track_id"] if follow["state"] in ("ACQUIRING", "TRACKING") else None
             result["target_mode"] = "none" if follow["state"] == IDLE else "locked"
             self.last_error = None
+            done = time.time()
+            self.latency.append(done - frame.t)
+            self.done_at.append(done)
             with self.cond:
                 self.seq += 1
                 result["seq"] = self.seq
@@ -278,9 +324,13 @@ def status():
         "source": pipeline.source_name,
         "model_loaded": pipeline.tracker is not None,
         "weights": YOLO_WEIGHTS,
+        "model": pipeline.models.current if hasattr(pipeline, "models") else None,
         "device": YOLO_DEVICE or "auto",
         "seq": seq,
         "loop_fps": round(pipeline.fps, 1),
+        "rate_hz": pipeline.rate_hz(),
+        "latency": pipeline.latency_stats(),
+        "align_ms": round(getattr(pipeline.source, "align_ms", 0.0), 1),
         "infer_ms": result["infer_ms"] if result else None,
         "result_age_s": round(time.time() - result["t"], 2) if result else None,
         "last_error": pipeline.last_error,
@@ -288,6 +338,34 @@ def status():
         "extrinsics": {"tx": EXTRINSICS.tx, "ty": EXTRINSICS.ty, "tz": EXTRINSICS.tz,
                        "pitch_deg": EXTRINSICS.pitch_deg, "yaw_deg": EXTRINSICS.yaw_deg},
     }
+
+
+class ModelChoice(BaseModel):
+    id: str
+    format: str = "engine"
+    imgsz: int = 640
+
+
+@app.get("/models")
+def models():
+    if not hasattr(pipeline, "models"):
+        raise HTTPException(503, "model manager not started yet")
+    return pipeline.models.summary()
+
+
+@app.post("/model", status_code=202, dependencies=[Depends(require_token)])
+def switch_model(choice: ModelChoice):
+    if not hasattr(pipeline, "models"):
+        raise HTTPException(503, "model manager not started yet")
+    try:
+        return {"switch": pipeline.models.request(choice.id, choice.format, choice.imgsz)}
+    except ModelSwitchError as exc:
+        raise HTTPException(exc.status, str(exc))
+
+
+@app.get("/system/power")
+def system_power():
+    return system_info.power()
 
 
 @app.get("/persons")
