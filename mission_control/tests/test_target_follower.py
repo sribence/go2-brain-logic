@@ -186,3 +186,13 @@ def test_config_from_env(monkeypatch):
     monkeypatch.setenv("FOLLOW_ACQUIRE_FRAMES", "3")
     cfg = FollowConfig.from_env()
     assert cfg.max_vx == 0.2 and cfg.acquire_frames == 3
+
+
+def test_latency_compensation_reduces_turn_while_already_turning():
+    f, t = locked_follower(x=1.0, y=0.4)                 # ~22 deg left
+    for _ in range(10):
+        t += DT
+        out = f.update([person(1, 1.0, 0.4)], {1: RED}, t)
+    fast = out["command"]["vyaw_desired"]
+    out = f.update([person(1, 1.0, 0.4)], {1: RED}, t + DT, now=t + DT + 0.5)
+    assert 0 <= out["command"]["vyaw_desired"] < fast

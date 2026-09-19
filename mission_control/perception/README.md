@@ -244,6 +244,43 @@ The container needs `realsense_bridge` with `align_depth:=true` and PNG depth
 Debug page: `http://192.168.123.18:9112/`, which shows the annotated stream,
 the live JSON, and lock/release buttons.
 
+## Live motion test, 2026-09-19
+
+Set-up: `mc_motion` (remote override, `/odom`), `follow_executor` with
+`EXEC_MAX_VX=0` (turn only), perception with `PERCEPTION_ALLOW_LIVE=1`.
+
+Results:
+
+- Remote override works. A stick push (`ly=-0.81`, later `lx=0.28`) while
+  armed disarmed `mc_motion` at once and latched the executor off.
+- The console E-stop did NOT reach `mc_motion`. The `go2_console` container
+  on the robot runs without `MOTION_URL`, so `/api/estop` posts nowhere.
+  Until that is fixed, stop with the remote or `POST :9102/estop`.
+- The robot turned toward the locked person (bearing 14.5 to 5.7 degrees),
+  but far too slowly: about 5 s after the person moved, then overshoot and
+  small back-and-forth steps.
+
+Cause, measured: camera to perception transport latency is 0.5 to 0.9 s at
+only 4 to 6 Hz (rosbridge sends 640x480 JPEG plus 16-bit PNG as base64 JSON).
+With the executor's 0.4 s staleness limit the robot kept stopping (14 stops).
+The Kalman filter also treated the robot's own turn as person motion.
+
+Fixes in this commit:
+
+- Frame time is the camera capture stamp, not the arrival time, so `age_s`
+  shows the real latency.
+- `POST /follow/ego` also moves the Kalman tracks into the new robot frame.
+- The follower predicts the bearing over the latency
+  (`bearing -= current_vyaw * latency`, `FOLLOW_LATENCY_COMP`), yaw deadband
+  6 degrees, `max_yaw_accel` 3.0.
+- A 424x240 camera mode was tried to cut the data: the D435i depth stream
+  fails to start in that mode ("Depth stream start failure"), so the bridge
+  is back at 640x480.
+
+Open: the transport latency itself. Options: read the camera directly in the
+perception container (pyrealsense2, `RS_SOURCE=realsense`) instead of through
+rosbridge, or a lower color resolution with a supported depth mode.
+
 ## Live dry-run test
 
 1. Open `http://192.168.123.18:9112/`.

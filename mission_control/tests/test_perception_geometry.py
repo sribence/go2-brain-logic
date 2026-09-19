@@ -117,3 +117,12 @@ def test_smoother_prunes_stale_tracks():
     s.update(2, 1.0, 0.0, 0.0, t=1.5)
     assert s.prune(t=2.0) == [1]
     assert s.get(2) is not None
+
+
+def test_smoother_ego_rotation_moves_track_not_person():
+    s = TrackSmoother()
+    for i in range(5):
+        s.update(1, 2.0, 0.0, 0.0, t=i * 0.1)
+    s.apply_ego_motion(0.0, 0.0, math.pi / 2)              # robot turned left 90 deg
+    st = s.get(1)
+    assert st.x == pytest.approx(0.0, abs=1e-6) and st.y == pytest.approx(-2.0)

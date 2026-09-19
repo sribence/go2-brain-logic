@@ -242,6 +242,23 @@ class TrackSmoother:
         self._sync(s)
         return s
 
+    def apply_ego_motion(self, dx: float, dy: float, dyaw: float) -> None:
+        """Robot moved by (dx, dy, dyaw) in its previous base frame: move every
+        track into the new frame, so the robot's own turn is not filtered as
+        the person moving (which lags and makes the follower overshoot)."""
+        c, s = math.cos(-dyaw), math.sin(-dyaw)
+        R = np.array([[c, -s], [s, c]])
+        T = np.eye(6)
+        T[:2, :2] = R
+        T[3:5, 3:5] = R
+        for st in list(self._tracks.values()):     # called from the HTTP thread
+            x = st.kf_x.copy()
+            x[0] -= dx
+            x[1] -= dy
+            st.kf_x = T @ x
+            st.kf_P = T @ st.kf_P @ T.T
+            self._sync(st)
+
     def prune(self, t: float) -> list:
         dead = [tid for tid, s in self._tracks.items() if t - s.last_t > self.max_age_s]
         for tid in dead:

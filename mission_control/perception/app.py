@@ -198,7 +198,7 @@ class Pipeline:
             with self.follow_lock:
                 prev_state = self.follower.state
                 self.supervisor.before_update(result["persons"], frame.t)
-                follow = self.follower.update(result["persons"], features, frame.t)
+                follow = self.follower.update(result["persons"], features, frame.t, now=time.time())
                 follow = self.supervisor.after_update(follow, frame.t)
             if follow["state"] != prev_state:
                 log_event("info", "follow state change", frm=prev_state, to=follow["state"],
@@ -431,6 +431,8 @@ def follow_ego(cmd: EgoCmd):
     while the robot turns or walks."""
     with pipeline.follow_lock:
         pipeline.follower.apply_ego_motion(cmd.dx, cmd.dy, cmd.dyaw)
+        if pipeline.tracker is not None:
+            pipeline.tracker.smoother.apply_ego_motion(cmd.dx, cmd.dy, cmd.dyaw)
     return {"ok": True}
 
 

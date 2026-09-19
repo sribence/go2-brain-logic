@@ -41,13 +41,14 @@ class FollowConfig:
     min_safe_distance_m: float = 0.7   # closer than this -> never drive forward
     k_distance: float = 0.8            # vx = k * distance error
     k_yaw: float = 1.5                 # vyaw = k * bearing (rad)
-    yaw_deadband_deg: float = 5.0
+    yaw_deadband_deg: float = 6.0
     turn_first_deg: float = 45.0       # vx scaled to 0 at this bearing: turn before driving
     max_vx: float = 0.5                # m/s  (Go2 can do much more -- start slow)
     max_reverse_vx: float = 0.0        # m/s  backing away disabled by default
     max_vyaw: float = 0.8              # rad/s
     max_accel: float = 0.5             # m/s^2, ramp-up limit (stopping is immediate)
-    max_yaw_accel: float = 1.5         # rad/s^2
+    max_yaw_accel: float = 3.0         # rad/s^2
+    latency_comp: bool = True          # predict bearing over (now - capture time)
     command_ttl_s: float = 0.5         # executor must drop a command older than this
     # --- target identity ---
     acquire_frames: int = 5            # frames to learn the appearance template
@@ -74,6 +75,7 @@ class TargetFollower:
     def __init__(self, cfg: Optional[FollowConfig] = None):
         self.cfg = cfg or FollowConfig()
         self.hold = False    # operator/gesture pause: keep tracking, command zero
+        self._latency = 0.0
         self._reset(IDLE, "no target locked")
 
     # ------------------------------------------------------------------ API
@@ -105,7 +107,11 @@ class TargetFollower:
         vx, vy = self.last_vel
         self.last_vel = np.array([c * vx - s * vy, s * vx + c * vy])
 
-    def update(self, persons: list[dict], features: dict[int, Optional[np.ndarray]], t: float) -> dict:
+    def update(self, persons: list[dict], features: dict[int, Optional[np.ndarray]], t: float,
+               now: Optional[float] = None) -> dict:
+        """`t` is the camera capture time; `now` (default `t`) is when the
+        command will be used. The gap is the pipeline latency."""
+        self._latency = 0.0 if now is None else min(max(now - t, 0.0), 1.0)
         visible = {p["track_id"]: p for p in persons if p["depth_ok"]}
         target: Optional[dict] = None
 
@@ -245,6 +251,11 @@ class TargetFollower:
             x, y = target["position"]["x"], target["position"]["y"]
             dist = math.hypot(x, y)
             bearing = math.atan2(y, x)
+            if cfg.latency_comp:
+                # The person was seen `latency` ago; the robot has kept turning
+                # at the current rate since then. Without this the turn
+                # overshoots and oscillates.
+                bearing -= float(self._cmd[1]) * self._latency
             err = dist - cfg.follow_distance_m
 
             vx = 0.0 if abs(err) < cfg.distance_deadband_m else cfg.k_distance * err

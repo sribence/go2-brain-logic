@@ -159,7 +159,13 @@ class RosbridgeSource(RGBDSource):
                     # Pair only frames within 100 ms and never serve the same pair twice.
                     if abs(tc - td) < 0.1 and newest > self._last_served and color.shape[:2] == depth.shape:
                         self._last_served = newest
-                        return RGBDFrame(color, depth, self._intr, time.time())
+                        # Capture time, not arrival time: the rosbridge hop
+                        # adds 0.2-0.9 s and downstream staleness checks and
+                        # latency compensation must see it. Same host clock;
+                        # fall back to arrival time if the stamp is off.
+                        now = time.time()
+                        t = min(tc, td)
+                        return RGBDFrame(color, depth, self._intr, t if 0 <= now - t < 5 else now)
                 remaining = deadline - time.time()
                 if remaining <= 0:
                     return None
