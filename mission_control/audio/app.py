@@ -103,8 +103,21 @@ def _try_aplay(path: str) -> bool:
         return False
 
 
-def play_file(path: str) -> tuple[bool, str]:
+def _try_webrtc_bridge(event_name: str) -> bool:
+    try:
+        import requests
+        r = requests.post(f"http://127.0.0.1:5001/audio/play/{event_name}", timeout=2.0)
+        if r.status_code == 200:
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def play_file(path: str, event_name: str = "") -> tuple[bool, str]:
     """Attempt playback via available backends. Returns (played, backend_used)."""
+    if event_name and _try_webrtc_bridge(event_name):
+        return True, "webrtc_bridge"
     if _try_simpleaudio(path):
         return True, "simpleaudio"
     if _try_aplay(path):
@@ -119,9 +132,7 @@ def play_event(event_name: str) -> dict:
     path = os.path.join(SOUNDS_DIR, filename)
     exists = os.path.isfile(path)
 
-    played, backend = (False, "none")
-    if exists:
-        played, backend = play_file(path)
+    played, backend = play_file(path, event_name=event_name)
 
     result = {
         "played": played,
@@ -132,7 +143,7 @@ def play_event(event_name: str) -> dict:
         "file_found": exists,
     }
     log_event(
-        "info" if exists else "warn",
+        "info" if exists or played else "warn",
         f"play event '{event_name}' -> {filename} (played={played}, backend={backend})",
         **result,
     )
