@@ -28,6 +28,7 @@ import math
 import os
 import threading
 import time
+from collections import deque
 from typing import Optional
 
 from flask import Flask, jsonify, request
@@ -63,6 +64,9 @@ _last_cmd = (0.0, 0.0, 0.0)
 _watchdog_trips = 0
 _events = []
 _odom = None            # (x, y, yaw, t) from rt/sportmodestate
+YAW_HISTORY_S = float(os.environ.get("YAW_HISTORY_S", "3.0"))
+_yaw_history = deque()  # (t, yaw) samples, last YAW_HISTORY_S seconds - for
+                         # LIDAR scan deskewing (interpolate yaw at point time)
 _remote_t = 0.0         # last rt/wirelesscontroller message
 _remote_msgs = 0
 _remote_overrides = 0
@@ -148,7 +152,13 @@ def _init_subscribers():
 
 def _on_sport_state(msg):
     global _odom
-    _odom = (float(msg.position[0]), float(msg.position[1]), float(msg.imu_state.rpy[2]), time.time())
+    t = time.time()
+    yaw = float(msg.imu_state.rpy[2])
+    _odom = (float(msg.position[0]), float(msg.position[1]), yaw, t)
+    _yaw_history.append((t, yaw))
+    cutoff = t - YAW_HISTORY_S
+    while _yaw_history and _yaw_history[0][0] < cutoff:
+        _yaw_history.popleft()
 
 
 def _on_remote(msg):
@@ -257,6 +267,15 @@ def odom():
     if o is None:
         return jsonify({"error": "nincs sportmodestate"}), 503
     return jsonify({"x": o[0], "y": o[1], "yaw": o[2], "t": o[3], "age_s": round(time.time() - o[3], 3)})
+
+
+@app.route("/imu/yaw_history")
+def yaw_history():
+    """Recent (t, yaw) samples for LIDAR scan deskewing: interpolate the
+    robot's yaw at each point's recv_time to un-warp a sweep taken while
+    turning. See project_go2_lidar_deskew_plan in memory for why."""
+    return jsonify({"samples": [{"t": t, "yaw": yaw} for t, yaw in _yaw_history],
+                     "window_s": YAW_HISTORY_S})
 
 
 @app.route("/status")
