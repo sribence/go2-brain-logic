@@ -268,6 +268,67 @@ def _reconstruct(came_from: dict, start: tuple[int, int], goal: tuple[int, int])
     return path
 
 
+POINT_VOXEL_SIZE = 0.05   # meters; first hit per voxel sticks, never overwritten
+POINT_Z_MIN = -0.5
+POINT_Z_MAX = 2.2
+POINT_MAP_MAX_VOXELS = 3_000_000  # ~caps memory; a real building is nowhere near this
+
+
+class PointMap:
+    """Persistent 3D point map: every LiDAR hit is bucketed into a voxel; the
+    first point to land in a voxel sticks there permanently (never moved or
+    aged out) as the robot walks through more rooms over time -- this is the
+    literal "points stay where they were seen" behaviour, not a rolling scan
+    buffer. Deliberately dumb: no loop-closure/relocalization, so a very long
+    walk (many rooms, out-and-back) will show the accumulated *odometry*
+    drift as double walls where the same real wall was seen twice from
+    poses that had already drifted apart -- see PROJECT_BRIEF /
+    docs/18-elo-terkep-perzisztencia for the known absence of ICP
+    relocalization in this stack.
+    """
+
+    def __init__(self, voxel_size: float = POINT_VOXEL_SIZE, max_voxels: int = POINT_MAP_MAX_VOXELS):
+        self.voxel_size = voxel_size
+        self.max_voxels = max_voxels
+        self._voxels: dict[tuple[int, int, int], tuple[float, float, float]] = {}
+
+    def add(self, points: Sequence[tuple[float, float, float]]) -> int:
+        """Adds world-frame (x, y, z) points, skipping ones outside the
+        floor-to-ceiling band and voxels already occupied. Returns how many
+        new voxels were actually added."""
+        vs = self.voxel_size
+        added = 0
+        for x, y, z in points:
+            if not (POINT_Z_MIN <= z <= POINT_Z_MAX):
+                continue
+            key = (int(math.floor(x / vs)), int(math.floor(y / vs)), int(math.floor(z / vs)))
+            if key in self._voxels:
+                continue
+            if len(self._voxels) >= self.max_voxels:
+                continue
+            self._voxels[key] = (round(x, 3), round(y, 3), round(z, 3))
+            added += 1
+        return added
+
+    def query(self, xmin: Optional[float] = None, xmax: Optional[float] = None,
+              ymin: Optional[float] = None, ymax: Optional[float] = None,
+              limit: int = 200_000) -> list[tuple[float, float, float]]:
+        """All points, or only those inside the given world-frame bbox --
+        callers should window by bbox once the map gets large."""
+        bounded = xmin is not None
+        out = []
+        for p in self._voxels.values():
+            if bounded and not (xmin <= p[0] <= xmax and ymin <= p[1] <= ymax):
+                continue
+            out.append(p)
+            if len(out) >= limit:
+                break
+        return out
+
+    def count(self) -> int:
+        return len(self._voxels)
+
+
 class StairDetector:
     """Heuristic level-change detector.
 

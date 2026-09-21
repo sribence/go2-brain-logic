@@ -17,6 +17,8 @@ import os
 import sys
 import threading
 import time
+import urllib.error
+import urllib.request
 from typing import Optional
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "core"))
@@ -28,6 +30,7 @@ from robot_client import get_robot_client
 
 from mapping_core import (
     MapStore,
+    PointMap,
     StairDetector,
     integrate_scan,
     next_frontier_target,
@@ -57,6 +60,20 @@ WAYPOINT_TIMEOUT_S = float(os.environ.get("EXPLORE_WAYPOINT_TIMEOUT_S", "8.0"))
 TICK_S = float(os.environ.get("EXPLORE_TICK_S", "0.1"))
 MAP_PUBLISH_INTERVAL_S = 1.0
 
+# -- live object overlay (perception -> world-frame markers) -------------
+PERCEPTION_URL = os.environ.get("PERCEPTION_URL", "http://127.0.0.1:9112")
+OBJECTS_POLL_HZ = float(os.environ.get("OBJECTS_POLL_HZ", "5"))
+OBJECTS_TTL_S = float(os.environ.get("OBJECTS_TTL_S", "2.0"))
+OBJECTS_HTTP_TIMEOUT_S = 0.5
+
+# -- continuous LiDAR ingest into the 2D grid + persistent 3D point map --
+# Runs always (armed or not, exploring or teleop-driven), unlike the 2D
+# grid's own integrate_scan calls inside _explore_loop which only fire
+# during autonomous frontier exploration -- this is what makes points
+# "stick" while the robot is just being walked around by hand.
+LIDAR_INGEST_HZ = float(os.environ.get("LIDAR_INGEST_HZ", "5"))
+POINTS3D_DEFAULT_LIMIT = int(os.environ.get("POINTS3D_DEFAULT_LIMIT", "200000"))
+
 LOG_DIR = os.path.join(os.path.dirname(__file__), "logs")
 LOG_PATH = os.path.join(LOG_DIR, "events.jsonl")
 os.makedirs(LOG_DIR, exist_ok=True)
@@ -74,6 +91,87 @@ def log_event(level: str, msg: str, **extra) -> None:
 
 def _wrap_angle(a: float) -> float:
     return (a + math.pi) % (2 * math.pi) - math.pi
+
+
+def base_to_world(robot_x: float, robot_y: float, robot_yaw: float,
+                   fwd: float, left: float) -> tuple[float, float]:
+    """Rotates a perception base-frame point (x=forward, y=left) into the
+    world frame using the robot's pose, same convention as
+    follow_executor.ego_delta (mission_control/follow_executor/executor.py)."""
+    c, s = math.cos(robot_yaw), math.sin(robot_yaw)
+    return robot_x + c * fwd - s * left, robot_y + s * fwd + c * left
+
+
+class ObjectOverlay:
+    """Polls perception's /persons and keeps a TTL'd world-frame marker per
+    track_id -- independent of exploration/arming, so it runs even when the
+    robot is just sitting still and being driven manually. Not folded into
+    the log-odds grid: these are transient, moving detections, not static
+    occupancy.
+    """
+
+    def __init__(self, robot):
+        self._robot = robot
+        self._lock = threading.Lock()
+        self._objects: dict[int, dict] = {}
+        self._last_error: Optional[str] = None
+        self._thread = threading.Thread(target=self._run, daemon=True, name="object_overlay")
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def _run(self) -> None:
+        period = 1.0 / OBJECTS_POLL_HZ
+        while True:
+            t0 = time.time()
+            try:
+                self._poll_once()
+            except Exception as exc:  # pragma: no cover - defensive, keep the service alive
+                self._last_error = str(exc)
+            self._prune()
+            time.sleep(max(0.0, period - (time.time() - t0)))
+
+    def _poll_once(self) -> None:
+        try:
+            with urllib.request.urlopen(f"{PERCEPTION_URL}/persons", timeout=OBJECTS_HTTP_TIMEOUT_S) as r:
+                result = json.loads(r.read())
+        except (urllib.error.URLError, TimeoutError, ConnectionError, ValueError) as exc:
+            self._last_error = str(exc)
+            return
+        self._last_error = None
+
+        pose = self._robot.get_pose()
+        now = time.time()
+        with self._lock:
+            for p in result.get("persons", []):
+                pos = p.get("position")
+                if not pos:
+                    continue
+                wx, wy = base_to_world(pose.x, pose.y, pose.yaw, pos["x"], pos["y"])
+                self._objects[p["track_id"]] = {
+                    "id": p["track_id"],
+                    "cls": "person",
+                    "x": round(wx, 3),
+                    "y": round(wy, 3),
+                    "confidence": p.get("confidence"),
+                    "last_seen": now,
+                }
+
+    def _prune(self) -> None:
+        now = time.time()
+        with self._lock:
+            stale = [tid for tid, o in self._objects.items() if now - o["last_seen"] > OBJECTS_TTL_S]
+            for tid in stale:
+                del self._objects[tid]
+
+    def list(self) -> dict:
+        now = time.time()
+        with self._lock:
+            objects = [
+                {**o, "age_s": round(now - o["last_seen"], 2)}
+                for o in self._objects.values()
+            ]
+        return {"objects": objects, "count": len(objects), "perception_error": self._last_error, "t": now}
 
 
 class MappingService:
@@ -101,6 +199,29 @@ class MappingService:
         self._state = "idle"          # idle | exploring | error
         self._last_error: Optional[str] = None
         self._last_publish_t = 0.0
+
+        self.objects = ObjectOverlay(self.robot)
+        self.objects.start()
+
+        self.points = PointMap()
+        self._ingest_thread = threading.Thread(target=self._lidar_ingest_loop, daemon=True,
+                                                 name="lidar_ingest")
+        self._ingest_thread.start()
+
+    def _lidar_ingest_loop(self) -> None:
+        period = 1.0 / LIDAR_INGEST_HZ
+        while True:
+            t0 = time.time()
+            try:
+                pose = self.robot.get_pose()
+                pts = self.robot.get_lidar_points()
+                if pts:
+                    integrate_scan(self.store.grid, pose.x, pose.y, pts)
+                    self.points.add(pts)
+                    self._maybe_publish()
+            except Exception as exc:  # pragma: no cover - defensive, keep the service alive
+                log_event("warn", "lidar ingest failed", error=str(exc))
+            time.sleep(max(0.0, period - (time.time() - t0)))
 
     # -- map access -------------------------------------------------
     def map_dict(self, level_id: Optional[str] = None) -> Optional[dict]:
@@ -269,6 +390,32 @@ def get_map(level_id: Optional[str] = None):
     if m is None:
         raise HTTPException(status_code=404, detail=f"unknown level_id {level_id!r}")
     return m
+
+
+@app.get("/objects")
+def get_objects():
+    return svc.objects.list()
+
+
+@app.get("/points3d")
+def get_points3d(xmin: Optional[float] = None, xmax: Optional[float] = None,
+                  ymin: Optional[float] = None, ymax: Optional[float] = None,
+                  limit: int = POINTS3D_DEFAULT_LIMIT):
+    """Persistent 3D point map (mapping_core.PointMap) -- every voxel the
+    robot has ever seen, world-frame, points stick permanently. Pass
+    xmin/xmax/ymin/ymax to window around the robot instead of pulling the
+    whole (potentially building-sized) map every poll."""
+    bounded = xmin is not None and xmax is not None and ymin is not None and ymax is not None
+    pts = svc.points.query(xmin, xmax, ymin, ymax, limit=limit) if bounded \
+        else svc.points.query(limit=limit)
+    total = svc.points.count()
+    return {
+        "points": [{"x": x, "y": y, "z": z} for x, y, z in pts],
+        "count": len(pts),
+        "total": total,
+        "truncated": len(pts) < total if not bounded else None,
+        "voxel_size": svc.points.voxel_size,
+    }
 
 
 @app.post("/explore/start", status_code=202)

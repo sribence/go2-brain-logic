@@ -28,6 +28,7 @@ import math
 import os
 import threading
 import time
+from typing import Optional
 
 from flask import Flask, jsonify, request
 
@@ -51,6 +52,10 @@ app = Flask(__name__)
 _lock = threading.Lock()
 _sport = None
 _sdk_error = "nem indult el"
+_vui = None
+_vui_error = "nem indult el"
+_led_switch = None       # 0/1, last known (synced from hardware at init)
+_led_brightness = None   # 0-10, last known (synced from hardware at init)
 _armed = False
 _armed_t = 0.0
 _last_cmd_t = 0.0
@@ -72,12 +77,21 @@ def _log(level, msg, **extra):
 
 
 def _init_sdk():
-    global _sport, _sdk_error
+    global _sport, _sdk_error, _vui, _vui_error, _led_switch, _led_brightness
     try:
         from unitree_sdk2py.core.channel import ChannelFactoryInitialize
-        from unitree_sdk2py.go2.sport.sport_client import SportClient
 
         ChannelFactoryInitialize(0, IFACE)
+    except Exception as exc:
+        with _lock:
+            _sdk_error = str(exc)[:200]
+            _vui_error = str(exc)[:200]
+        _log("error", f"ChannelFactory nem indult: {exc}")
+        return
+
+    try:
+        from unitree_sdk2py.go2.sport.sport_client import SportClient
+
         c = SportClient()
         c.SetTimeout(3.0)
         c.Init()
@@ -89,7 +103,31 @@ def _init_sdk():
         with _lock:
             _sdk_error = str(exc)[:200]
         _log("error", f"SportClient nem indult: {exc}")
-        return
+
+    try:
+        # go2/vui, NOT a2/audio -- the a2 AudioClient's "voice" DDS service
+        # does not answer on this unit (RPC_ERR_CLIENT_SEND every call,
+        # confirmed on GetVolume() too, not LED-specific). go2/vui's "vui"
+        # service does answer: it is the robot's real status-LED control,
+        # on/off + brightness only, no RGB (vui_api.py has no color call).
+        from unitree_sdk2py.go2.vui.vui_client import VuiClient
+
+        vc = VuiClient()
+        vc.SetTimeout(3.0)
+        vc.Init()
+        code_sw, sw = vc.GetSwitch()
+        code_br, br = vc.GetBrightness()
+        with _lock:
+            _vui = vc
+            _vui_error = None
+            _led_switch = sw if code_sw == 0 else None
+            _led_brightness = br if code_br == 0 else None
+        _log("info", f"VuiClient (LED) kesz ({IFACE}), switch={sw} brightness={br}")
+    except Exception as exc:
+        with _lock:
+            _vui_error = str(exc)[:200]
+        _log("error", f"VuiClient nem indult: {exc}")
+
     _init_subscribers()
 
 
@@ -195,7 +233,10 @@ threading.Thread(target=_watchdog, daemon=True, name="motion-watchdog").start()
 def health():
     with _lock:
         return jsonify({"ok": True, "pillar": "mc_motion", "sdk_ready": _sport is not None,
-                        "sdk_error": _sdk_error, "armed": _armed,
+                        "sdk_error": _sdk_error,
+                        "led_ready": _vui is not None, "led_error": _vui_error,
+                        "led": {"switch": _led_switch, "brightness": _led_brightness},
+                        "armed": _armed,
                         "limits": {"max_vx": MAX_VX, "max_vy": MAX_VY, "max_vyaw": MAX_VYAW},
                         "command_timeout_s": COMMAND_TIMEOUT_S,
                         # The console polls /health, so the arm timeout has to
@@ -317,24 +358,116 @@ def obstacle_avoid():
     return jsonify({"obstacle_avoid": _obstacle_avoid_enabled})
 
 
-_light_on = False
+# go2/vui's real, live service: on/off + brightness only. No RGB/color
+# call exists in vui_api.py -- confirmed against the live robot, see
+# _init_sdk's comment. These presets are switch+brightness combos, not colors.
+LED_PRESETS = {
+    "off": {"switch": 0},
+    "on": {"switch": 1, "brightness": 10},
+    "dim": {"switch": 1, "brightness": 3},
+    "bright": {"switch": 1, "brightness": 10},
+}
+
+
+def _set_led(switch: Optional[int] = None, brightness: Optional[int] = None):
+    """Real hardware call: go2.vui.VuiClient.SetSwitch / SetBrightness (the
+    robot's status LED). Never gated on arming -- a light is not a
+    safety-relevant motion. Only the fields passed are changed."""
+    global _led_switch, _led_brightness
+    with _lock:
+        if _vui is None:
+            return f"VuiClient nem elerheto: {_vui_error}"
+        vui = _vui
+
+    if switch is not None:
+        code = vui.SetSwitch(switch)
+        if code != 0:
+            _log("error", f"LED switch beallitas sikertelen: kod={code}")
+            return f"SetSwitch hibakod: {code}"
+        with _lock:
+            _led_switch = switch
+
+    if brightness is not None:
+        code = vui.SetBrightness(brightness)
+        if code != 0:
+            _log("error", f"LED fenyero beallitas sikertelen: kod={code}")
+            return f"SetBrightness hibakod: {code}"
+        with _lock:
+            _led_brightness = brightness
+
+    _log("info", f"LED beallitva: switch={_led_switch} brightness={_led_brightness}")
+    return None
+
+
+@app.route("/led", methods=["GET", "POST"])
+def led():
+    """POST body: {"switch": 0|1} and/or {"brightness": 0-10}. Both optional,
+    only the fields present are changed. GET returns the last known state
+    (read from hardware at startup, then tracked locally on every set)."""
+    if request.method == "GET":
+        return jsonify({"switch": _led_switch, "brightness": _led_brightness, "vui_error": _vui_error})
+
+    data = request.get_json(silent=True) or {}
+    if "switch" not in data and "brightness" not in data:
+        return jsonify({"error": "legalabb 'switch' (0|1) vagy 'brightness' (0-10) kotelezo"}), 422
+
+    switch = None
+    if "switch" in data:
+        try:
+            switch = int(data["switch"])
+        except (TypeError, ValueError):
+            return jsonify({"error": "switch: 0 vagy 1"}), 422
+        if switch not in (0, 1):
+            return jsonify({"error": "switch: 0 vagy 1"}), 422
+
+    brightness = None
+    if "brightness" in data:
+        try:
+            brightness = int(data["brightness"])
+        except (TypeError, ValueError):
+            return jsonify({"error": "brightness: 0-10 egesz"}), 422
+        if not 0 <= brightness <= 10:
+            return jsonify({"error": "brightness tartomany 0-10"}), 422
+
+    err = _set_led(switch, brightness)
+    if err:
+        return jsonify({"error": err}), 503
+    return jsonify({"ok": True, "switch": _led_switch, "brightness": _led_brightness})
+
+
+@app.route("/led/presets", methods=["GET"])
+def led_presets():
+    return jsonify(LED_PRESETS)
+
+
+@app.route("/led/preset/<name>", methods=["POST"])
+def led_preset(name):
+    preset = LED_PRESETS.get(name)
+    if preset is None:
+        return jsonify({"error": f"ismeretlen preset {name!r}", "known": sorted(LED_PRESETS)}), 404
+    err = _set_led(preset.get("switch"), preset.get("brightness"))
+    if err:
+        return jsonify({"error": err}), 503
+    return jsonify({"ok": True, "preset": name, "switch": _led_switch, "brightness": _led_brightness})
 
 
 @app.route("/action/<name>", methods=["POST"])
 def action(name):
     """Posture and gesture commands."""
-    global _light_on
+    if name in ("search_light", "light"):
+        target = 0 if _led_switch else 1
+        err = _set_led(switch=target, brightness=10 if target else None)
+        if err:
+            return jsonify({"error": err}), 503
+        return jsonify({"ok": True, "action": name, "light": bool(target),
+                         "switch": _led_switch, "brightness": _led_brightness})
+
     with _lock:
         if _sport is None:
             return jsonify({"error": f"SportClient nem elerheto: {_sdk_error}"}), 503
-        if not _armed and name not in ("damp", "search_light", "light"):
+        if not _armed and name not in ("damp",):
             return jsonify({"error": "a robot nincs elesitve"}), 409
         sport = _sport
-
-    if name in ("search_light", "light"):
-        _light_on = not _light_on
-        _log("info", f"Keresőfény kapcsolva: {_light_on}")
-        return jsonify({"ok": True, "action": name, "light": _light_on})
 
     fns = {
         "stand": getattr(sport, "RecoveryStand", getattr(sport, "StandUp", None)),
