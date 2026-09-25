@@ -87,11 +87,7 @@ def _init_sdk():
 
         ChannelFactoryInitialize(0, IFACE)
     except Exception as exc:
-        with _lock:
-            _sdk_error = str(exc)[:200]
-            _vui_error = str(exc)[:200]
-        _log("error", f"ChannelFactory nem indult: {exc}")
-        return
+        _log("warning", f"ChannelFactory init megjegyzés: {exc}")
 
     try:
         from unitree_sdk2py.go2.sport.sport_client import SportClient
@@ -292,7 +288,10 @@ def status():
 def arm():
     global _armed, _armed_t
     body = request.get_json(silent=True) or {}
-    want = bool(body.get("armed", True))
+    val = body.get("armed")
+    want = True if val is None else bool(val)
+    if want and _sport is None:
+        _init_sdk()
     with _lock:
         if want and _sport is None:
             return jsonify({"error": f"SportClient nem elerheto: {_sdk_error}"}), 503

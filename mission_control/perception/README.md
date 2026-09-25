@@ -204,7 +204,12 @@ are not implemented yet: the response has `executed: false`.
 |---|---|---|
 | `RS_SOURCE` | `mock` | `realsense` (robot, direct), `rosbridge` (old path), `mock` |
 | `RS_WIDTH` / `RS_HEIGHT` / `RS_FPS` | `640` / `480` / `30` | camera mode; `deploy.sh` sets `RS_FPS=15` |
-| `RS_HW_RESET` | – | `1` resets the camera before opening it (set automatically after a stall) |
+| `RS_HW_RESET` | – | `1` resets the camera before every open |
+| `RS_RESET_ON_START` | `1` | reset the camera once before the first open of a fresh process (`0` = off) |
+| `RS_OPEN_WAIT_S` | `8` | seconds to wait for librealsense to list the camera before an open counts as failed |
+| `RS_EXIT_AFTER_FAILURES` | `10` | consecutive failures after which the process exits so Docker restarts it |
+| `RS_USB_KEEP_AWAKE` | `1` (deploy.sh) | `1` writes `on` to the camera's USB `power/control` (host sysfs, resets at reboot) |
+| `PERCEPTION_DEADMAN_S` | `120` | the process exits if its loop thread makes no progress for this long |
 | `REALSENSE_ROSBRIDGE_HOST` / `_PORT` | `localhost` / `9091` | realsense_bridge address |
 | `YOLO_MODEL` / `YOLO_FORMAT` | `yolov8n` / `engine` | start model; a choice made with `POST /model` (saved in `models/selected.json`) wins |
 | `YOLO_WEIGHTS` | `yolov8n.pt` | fallback if the model manager fails |
@@ -331,3 +336,25 @@ rosbridge, or a lower color resolution with a supported depth mode.
 python -m pytest tests/test_perception_geometry.py tests/test_target_follower.py tests/test_follow_modes.py -q
 RS_SOURCE=mock python perception/app.py                      # full pipeline on a photo
 ```
+
+
+## Camera self-healing (`camera_recovery.py`)
+
+The camera has ONE owner: this container (`RS_SOURCE=realsense`). The
+`nero_go2_realsense_bridge` container must stay stopped with restart policy
+`no` (`docker update --restart=no nero_go2_realsense_bridge`); with both
+running, the bridge wins the USB device and perception sees "No device
+connected". `GET /status` -> `camera` shows the failure count, the last
+recovery step and whether frames are streaming.
+
+Steps, by consecutive failures: reopen, `hardware_reset`, then the process
+exits and Docker starts a clean one. When the kernel lists the camera but
+librealsense does not ("blind"), only a fresh process sees it again, so that
+case exits at once. Every fresh process resets the camera once before its
+first open.
+
+`USBDEVFS_RESET` and sysfs replug are NOT used: on a streaming D435i they made
+it drop off the bus for good (kernel "Device not responding to setup address",
+error -71). If the camera is not in sysfs at all, `/status` -> `camera` shows
+`state: absent`, `needs_replug: true`; the loop only polls sysfs and opens the
+camera the moment the cable is replugged. No software step revives that state.

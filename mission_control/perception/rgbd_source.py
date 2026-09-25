@@ -26,6 +26,7 @@ from typing import Optional
 
 import numpy as np
 
+import camera_recovery
 from geometry3d import Intrinsics
 
 logger = logging.getLogger("perception.rgbd_source")
@@ -64,21 +65,26 @@ class RealSenseSource(RGBDSource):
     """
     name = "realsense"
 
-    def __init__(self, width: int = 640, height: int = 480, fps: int = 30):
+    def __init__(self, width: int = 640, height: int = 480, fps: int = 30, hw_reset: bool = False):
         import pyrealsense2 as rs
 
         self._rs = rs
-        if os.environ.get("RS_HW_RESET") == "1":
-            devs = rs.context().query_devices()
-            if len(devs):
-                logger.warning("realsense hardware reset before reopen")
-                devs[0].hardware_reset()
-                time.sleep(5)          # the device re-enumerates on USB
+        if os.environ.get("RS_USB_KEEP_AWAKE") == "1":
+            logger.info(camera_recovery.keep_awake())
+        # A fresh context per query: after a reset or replug the old one is stale.
+        devs = self._wait_for_device(float(os.environ.get("RS_OPEN_WAIT_S", "8")))
+        if hw_reset:
+            logger.warning("realsense hardware reset before reopen")
+            devs[0].hardware_reset()
+            time.sleep(3)              # the device re-enumerates on USB
+            devs = self._wait_for_device(float(os.environ.get("RS_RESET_WAIT_S", "15")))
         self._pipe = rs.pipeline()
         cfg = rs.config()
         cfg.enable_stream(rs.stream.color, width, height, rs.format.bgr8, fps)
         cfg.enable_stream(rs.stream.depth, width, height, rs.format.z16, fps)
         profile = self._pipe.start(cfg)
+        if os.environ.get("RS_USB_KEEP_AWAKE") == "1":
+            logger.info(camera_recovery.keep_awake())   # a reset re-enumerates and restores autosuspend
         dev = profile.get_device()
         for sensor in dev.query_sensors():
             if sensor.supports(rs.option.global_time_enabled):
@@ -99,6 +105,18 @@ class RealSenseSource(RGBDSource):
         self._thread = threading.Thread(target=self._grab, daemon=True, name="rs-grab")
         self._thread.start()
         logger.info("realsense started %dx%d@%d, depth_scale=%.4f mm", width, height, fps, self._depth_scale_mm)
+
+    def _wait_for_device(self, timeout_s: float):
+        """Poll until librealsense lists the camera; a camera that has just
+        been reset or replugged needs several seconds to show up again."""
+        end = time.time() + timeout_s
+        while True:
+            devs = self._rs.context().query_devices()
+            if len(devs):
+                return devs
+            if time.time() >= end:
+                raise RuntimeError("No device connected (waited %.0f s)" % timeout_s)
+            time.sleep(0.5)
 
     def _grab(self) -> None:
         while not self._stop.is_set():
@@ -275,13 +293,14 @@ class MockSource(RGBDSource):
         return RGBDFrame(self._img.copy(), depth, self._intr, t)
 
 
-def make_source() -> RGBDSource:
+def make_source(hw_reset: bool = False) -> RGBDSource:
     kind = os.environ.get("RS_SOURCE", "mock").lower()
     if kind == "realsense":
         return RealSenseSource(
             int(os.environ.get("RS_WIDTH", "640")),
             int(os.environ.get("RS_HEIGHT", "480")),
             int(os.environ.get("RS_FPS", "30")),
+            hw_reset=hw_reset or os.environ.get("RS_HW_RESET") == "1",
         )
     if kind == "rosbridge":
         return RosbridgeSource(

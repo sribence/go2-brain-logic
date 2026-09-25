@@ -42,6 +42,7 @@ from dataclasses import asdict
 from typing import Optional
 
 import cv2
+import numpy as np
 import uvicorn
 from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -49,6 +50,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingRes
 from pydantic import BaseModel
 
 import appearance
+import camera_recovery
 from geometry3d import Extrinsics
 from model_manager import ModelManager, ModelSwitchError
 from person_tracker import PersonTracker, annotate
@@ -171,6 +173,18 @@ class Pipeline:
         self.latency = deque(maxlen=50)      # capture -> result, seconds
         self.done_at = deque(maxlen=30)      # result times, for the real loop rate
         self.source: Optional[object] = None
+        self.camera = camera_recovery.CameraSupervisor()
+        self.loop_beat = time.time()
+
+    def _deadman(self) -> None:
+        """If the loop thread hangs (a blocked librealsense call), the API would
+        stay "Up" with stale data. Exit so Docker restarts a clean process."""
+        limit = float(os.environ.get("PERCEPTION_DEADMAN_S", "120"))
+        while not self._stop.wait(5.0):
+            if time.time() - self.loop_beat > limit:
+                logger.error("perception loop stuck for %.0f s, exiting for restart", time.time() - self.loop_beat)
+                log_event("error", "loop stuck, exiting for restart")
+                os._exit(4)
 
     def _apply_model(self, model, spec: dict) -> None:
         half = spec["format"] == "pt" and bool(YOLO_DEVICE)
@@ -211,35 +225,60 @@ class Pipeline:
                 logger.warning("engine auto-build not started: %s", exc)
         source = None
         misses = 0
+        self.loop_beat = time.time()
+        threading.Thread(target=self._deadman, daemon=True, name="perception-deadman").start()
         while not self._stop.is_set():
+            self.loop_beat = time.time()
             if source is None:
+                # Not on the USB bus at all: nothing to open and no restart helps.
+                # Watch sysfs (cheap) and open the moment the camera is back.
+                absent = camera_recovery.usb_bus_readable() and camera_recovery.find_realsense() is None
+                self.camera.set_absent(absent)
+                if absent:
+                    self._fail("camera is not on the USB bus (hung firmware or unplugged) - replug the USB cable")
+                    self._stop.wait(2.0)
+                    continue
+                action = self.camera.before_open()
+                if action != "retry":
+                    log_event("warn", "camera recovery step", action=action,
+                              failures=self.camera.failures, blind=self.camera.blind)
+                if action == "exit":
+                    # librealsense can be blind inside a long-running process. A
+                    # clean process (Docker restarts the container) sees the camera.
+                    logger.error("camera failed %d times in a row, exiting for a clean restart",
+                                 self.camera.failures)
+                    log_event("error", "camera not usable, exiting for restart", failures=self.camera.failures)
+                    os._exit(3)
                 try:
-                    source = make_source()
+                    source = make_source(hw_reset=self.camera.want_hw_reset)
                     self.source = source
                     self.source_name = source.name
                     self.last_error = None
-                    log_event("info", "rgbd source opened", source=source.name)
+                    log_event("info", "rgbd source opened", source=source.name, action=action)
                 except Exception as exc:
                     self._fail(f"source open failed: {exc}")
-                    self._stop.wait(3.0)
+                    blind = "No device connected" in str(exc) and camera_recovery.find_realsense() is not None
+                    self.camera.note_failure(blind=blind)
+                    self._stop.wait(camera_recovery.backoff_s(self.camera.failures))
                     continue
             frame = source.read(timeout_s=2.0)
             if frame is None:
                 misses += 1
                 self._fail("no frame within 2 s")
                 if misses >= 3:
-                    # The camera sometimes stalls on the first start after a
-                    # robot boot. Reopen it (with a hardware reset) instead of
-                    # waiting forever.
+                    # The camera sometimes stalls (first start after a robot
+                    # boot, USB hiccup). Reopen it; each further failure in a
+                    # row climbs the recovery ladder in camera_recovery.
                     log_event("warn", "rgbd source stalled, reopening", source=source.name)
                     try:
                         source.close()
                     except Exception:
                         pass
                     source, misses = None, 0
-                    os.environ["RS_HW_RESET"] = "1"
+                    self.camera.note_failure()
                 continue
             misses = 0
+            self.camera.note_frame()
             t0 = time.time()
             try:
                 result = self.tracker.process(frame)
@@ -348,6 +387,7 @@ def status():
         "infer_ms": result["infer_ms"] if result else None,
         "result_age_s": round(time.time() - result["t"], 2) if result else None,
         "last_error": pipeline.last_error,
+        "camera": pipeline.camera.status(),
         "follow_state": result["follow"]["state"] if result else None,
         "extrinsics": {"tx": EXTRINSICS.tx, "ty": EXTRINSICS.ty, "tz": EXTRINSICS.tz,
                        "pitch_deg": EXTRINSICS.pitch_deg, "yaw_deg": EXTRINSICS.yaw_deg},
@@ -433,6 +473,63 @@ async def stream_mjpg():
             if jpeg:
                 yield b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + jpeg + b"\r\n"
     return StreamingResponse(gen(), media_type="multipart/x-mixed-replace; boundary=frame")
+
+
+DEPTH_MAX_MM = 6000
+
+
+def _depth_jpeg() -> Optional[bytes]:
+    """Depth as a JET heat map (near = red, far = blue, no data = black)."""
+    _, frame, _ = pipeline.snapshot()
+    if frame is None:
+        return None
+    d = frame.depth_mm
+    norm = np.clip(255 - d.astype(np.float32) * (255.0 / DEPTH_MAX_MM), 0, 255).astype(np.uint8)
+    heat = cv2.applyColorMap(norm, cv2.COLORMAP_JET)
+    heat[d == 0] = 0
+    ok, buf = cv2.imencode(".jpg", heat, [int(cv2.IMWRITE_JPEG_QUALITY), 75])
+    return buf.tobytes() if ok else None
+
+
+@app.get("/depth.jpg")
+def depth_jpg():
+    jpeg = _depth_jpeg()
+    if jpeg is None:
+        raise HTTPException(status_code=503, detail="no frame yet")
+    return Response(jpeg, media_type="image/jpeg")
+
+
+@app.get("/depth.mjpg")
+async def depth_mjpg():
+    async def gen():
+        seq = -1
+        while True:
+            seq = await _in_thread(pipeline.wait_next, seq)
+            jpeg = await _in_thread(_depth_jpeg)
+            if jpeg:
+                yield b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + jpeg + b"\r\n"
+    return StreamingResponse(gen(), media_type="multipart/x-mixed-replace; boundary=frame")
+
+
+@app.get("/pointcloud.json")
+def pointcloud_json(step: int = 8, max_m: float = 6.0):
+    """Coloured point cloud in the camera optical frame (x right, y down, z
+    forward, metres). `step` = pixel stride (8 -> ~4800 points)."""
+    _, frame, _ = pipeline.snapshot()
+    if frame is None:
+        raise HTTPException(status_code=503, detail="no frame yet")
+    step = max(2, min(step, 32))
+    i = frame.intrinsics
+    d = frame.depth_mm[::step, ::step].astype(np.float32) / 1000.0
+    v, u = np.mgrid[0:frame.depth_mm.shape[0]:step, 0:frame.depth_mm.shape[1]:step]
+    ok = (d > 0.1) & (d < max_m)
+    z = d[ok]
+    x = (u[ok] - i.cx) * z / i.fx
+    y = (v[ok] - i.cy) * z / i.fy
+    rgb = frame.color_bgr[::step, ::step][ok][:, ::-1]
+    pts = np.column_stack([x, y, z, rgb]).round(3)
+    return {"t": frame.t, "frame": "camera_optical", "fields": ["x", "y", "z", "r", "g", "b"],
+            "points": pts.tolist()}
 
 
 class TargetCmd(BaseModel):
