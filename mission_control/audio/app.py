@@ -33,6 +33,10 @@ SOUND_LIBRARY = {
     "proximity_warning": "proximity_warning.wav",
     "task_complete": "task_complete.wav",
     "test": "test.wav",
+    "low_battery": "low_battery.wav",
+    "incident": "incident.wav",
+    "obstacle_avoidance": "obstacle_avoidance",
+    "companion_mode": "companion_mode",
 }
 DEFAULT_SOUND = "test.wav"
 
@@ -58,12 +62,6 @@ def log_event(level: str, msg: str, **extra) -> None:
 # --------------------------------------------------------------------------- playback backends
 
 def _try_simpleaudio(path: str) -> bool:
-    # Run in a throwaway subprocess rather than importing simpleaudio in-process:
-    # on some hosts (observed on Windows dev/no real output device, and
-    # plausible in a headless container with a broken ALSA stack)
-    # simpleaudio's native playback call can segfault the whole process
-    # instead of raising a catchable Python exception. Isolating it means a
-    # bad host only loses this one playback attempt, not the whole service.
     try:
         import sys
 
@@ -77,10 +75,6 @@ def _try_simpleaudio(path: str) -> bool:
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
-        # Give it a brief moment to fail fast (e.g. simpleaudio not
-        # installed, no output device) so we can fall back to aplay;
-        # otherwise treat it as a successful hand-off and let it finish
-        # playing in the background.
         try:
             returncode = proc.wait(timeout=0.3)
             return returncode == 0
@@ -106,7 +100,7 @@ def _try_aplay(path: str) -> bool:
 def _try_webrtc_bridge(event_name: str) -> bool:
     try:
         import requests
-        r = requests.post(f"http://127.0.0.1:5001/audio/play/{event_name}", timeout=2.0)
+        r = requests.post(f"http://127.0.0.1:5001/audio/play/{event_name}", timeout=10.0)
         if r.status_code == 200:
             return True
     except Exception:
@@ -210,6 +204,17 @@ async def _on_startup():
 @app.post("/audio/play/{event_name}")
 def play(event_name: str):
     return play_event(event_name)
+
+
+@app.post("/api/speak")
+@app.post("/audio/speak")
+def speak(payload: dict):
+    try:
+        import requests
+        r = requests.post("http://127.0.0.1:5001/api/speak", json=payload, timeout=15.0)
+        return r.json()
+    except Exception as exc:
+        return {"error": str(exc)}
 
 
 @app.get("/audio/library")
