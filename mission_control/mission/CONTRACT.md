@@ -136,3 +136,6 @@ Külön, érintés-first oldal: `digital-twin/static/omni_mobile.html` + `static
 - Feladat-kiosztás: `POST /fleet/missions {mission, robot_id?|"auto"}` → auto = legközelebbi szabad robot (útvonal-hossz a robot tervezőjével, akku-súlyozva); `POST /fleet/alert` → a legközelebbi robot `watch`/`shadow`-ot kap.
 - Ütközés-elkerülés robotok közt: minden robot a többit „mozgó akadályként” kapja (`mc.fleet.robots` → `safety_guard` opcionálisan személyként kezeli, 1.5 m-es buborékkal).
 - UI: `GET /fleet` oldal (digital-twin route, F1 írja: `static/fleet.html` + `static/fleet/*.js`) — felülnézeti közös térkép az összes robottal, misszió-kiosztás drag&drop-pal, robotonkénti kamera-csempék, riasztás-lista, robotra kattintva megnyílik az adott robot OmniView-ja.
+
+> ELTÉRÉS (M6/M1): `patrol` lépésnél a pontossági mező `pass_zone` (a `zone` ott a járőr-terület neve).
+> ELTÉRÉS (M6): Opus 5.5 nem fogad kényszerített `tool_choice`-t → `auto` + `disable_parallel_tool_use`; `NL_FORCE_TOOL=1` régebbi modellhez.
