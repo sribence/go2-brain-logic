@@ -6,6 +6,7 @@ operator send the robot to a point on the floor.
 
 Endpoints:
     GET  /                     -- static single-page app (index.html)
+    GET  /omni                 -- OmniVision 360 console (omni.html, ?demo=1)
     GET  /api/map_proxy        -- proxies + briefly caches mapping's GET /map
     GET  /api/state            -- combined core + navigation state for the HUD
     POST /api/goto             -- proxies navigation's POST /goto
@@ -125,6 +126,12 @@ async def _fetch_state() -> dict:
 @app.get("/")
 def index():
     return FileResponse(os.path.join(STATIC_DIR, "index.html"))
+
+
+@app.get("/omni")
+def omni_view():
+    """OmniVision 360 operator console (static/omni.html). Demo: /omni?demo=1."""
+    return FileResponse(os.path.join(STATIC_DIR, "omni.html"))
 
 
 @app.get("/health")

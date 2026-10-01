@@ -1,0 +1,228 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<meta name="theme-color" content="#02050a" />
+<title>OmniVision 360</title>
+<style>
+  :root {
+    --bg: #02050a;
+    --panel: rgba(4, 12, 20, 0.72);
+    --line: rgba(0, 210, 255, 0.28);
+    --pri: #00d8ff;
+    --pri-rgb: 0, 216, 255;
+    --text: #cfeeff;
+    --muted: #6f93a8;
+    --ok: #35f28a; --warn: #ffd23a; --orange: #ff8a1e; --crit: #ff3344; --tgt: #ff2bd6;
+    --mono: ui-monospace, "SF Mono", "Cascadia Mono", "Roboto Mono", Menlo, Consolas, monospace;
+  }
+  body.night { --pri: #ffb020; --pri-rgb: 255, 176, 32; --line: rgba(255, 176, 32, 0.3); --text: #ffe9c2; --muted: #a08a5c; }
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  html, body { margin: 0; height: 100%; background: var(--bg); color: var(--text); font-family: var(--mono); overflow: hidden; overscroll-behavior: none; }
+  #viewport { position: absolute; inset: 0; touch-action: none; }
+  #viewport canvas { display: block; }
+  /* scanline + vignette overlay */
+  #fx { position: absolute; inset: 0; pointer-events: none; z-index: 5;
+        background: radial-gradient(ellipse at center, transparent 55%, rgba(0,0,0,.55) 100%),
+                    repeating-linear-gradient(0deg, rgba(255,255,255,.025) 0 1px, transparent 1px 3px); }
+  body.night #fx { background: radial-gradient(ellipse at center, transparent 45%, rgba(0,10,0,.7) 100%),
+                    repeating-linear-gradient(0deg, rgba(120,255,140,.05) 0 1px, transparent 1px 3px); }
+  body.estop-flash #fx { background: rgba(255, 30, 50, .35); transition: background .1s; }
+
+  .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 6px; backdrop-filter: blur(6px);
+           box-shadow: 0 0 18px rgba(var(--pri-rgb), .08), inset 0 0 12px rgba(var(--pri-rgb), .05); }
+  .lbl { color: var(--muted); font-size: 10px; letter-spacing: .14em; text-transform: uppercase; }
+
+  /* ---------- top bar ---------- */
+  #topbar { position: absolute; top: 0; left: 0; right: 0; z-index: 20; display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+            padding: calc(8px + env(safe-area-inset-top, 0px)) 12px 8px; background: linear-gradient(180deg, rgba(2,5,10,.92) 55%, transparent); }
+  .brand { font-weight: 700; letter-spacing: .2em; font-size: 14px; color: var(--pri); text-shadow: 0 0 10px rgba(var(--pri-rgb), .7); white-space: nowrap; }
+  .brand b { color: var(--text); margin-left: 4px; }
+  .chip { display: inline-flex; align-items: center; gap: 6px; padding: 4px 9px; font-size: 11.5px; border: 1px solid var(--line); border-radius: 3px;
+          background: var(--panel); white-space: nowrap; font-variant-numeric: tabular-nums; }
+  .chip .k { color: var(--muted); font-size: 10px; letter-spacing: .1em; }
+  #mode-chip { color: var(--pri); border-color: var(--pri); }
+  #src-chip[data-state="demo"] { color: var(--warn); border-color: var(--warn); }
+  #src-chip[data-state="live"] { color: var(--ok); border-color: var(--ok); }
+  .links { display: inline-flex; gap: 4px; }
+  .link { font-size: 9.5px; padding: 3px 5px; border-radius: 2px; border: 1px solid #23313c; color: var(--muted); letter-spacing: .06em; }
+  .link[data-state="live"] { color: var(--ok); border-color: rgba(53,242,138,.5); }
+  .link[data-state="demo"] { color: var(--warn); border-color: rgba(255,210,58,.45); }
+  .link[data-state="connecting"] { color: var(--orange); border-color: rgba(255,138,30,.5); }
+  .link[data-state="down"] { color: var(--crit); border-color: rgba(255,51,68,.5); }
+  #spacer { flex: 1; }
+  #batt-track { width: 34px; height: 7px; background: #13202a; border-radius: 2px; overflow: hidden; }
+  #batt-fill { height: 100%; width: 0; background: var(--ok); transition: width .4s; }
+  #batt-fill[data-state="warn"] { background: var(--warn); } #batt-fill[data-state="bad"] { background: var(--crit); }
+
+  /* ---------- safety badge ---------- */
+  #safety { position: absolute; top: 58px; left: 50%; transform: translateX(-50%); z-index: 15; min-width: 280px; text-align: center; padding: 6px 16px 8px; }
+  #safety-level { font-size: 26px; font-weight: 800; letter-spacing: .3em; }
+  #safety .row { display: flex; justify-content: center; gap: 14px; font-size: 11px; color: var(--muted); }
+  #safety-near { color: var(--text); }
+  #safety[data-level="CLEAR"] #safety-level { color: var(--ok); text-shadow: 0 0 14px rgba(53,242,138,.6); }
+  #safety[data-level="CAUTION"] #safety-level { color: var(--warn); text-shadow: 0 0 14px rgba(255,210,58,.6); }
+  #safety[data-level="SLOW"] { border-color: var(--orange); } #safety[data-level="SLOW"] #safety-level { color: var(--orange); text-shadow: 0 0 16px rgba(255,138,30,.8); }
+  #safety[data-level="STOP"] { border-color: var(--crit); animation: blink .5s steps(2) infinite; }
+  #safety[data-level="STOP"] #safety-level { color: var(--crit); text-shadow: 0 0 18px rgba(255,51,68,.9); }
+  #safety[data-level="UNKNOWN"] #safety-level { color: var(--muted); }
+  @keyframes blink { 50% { background: rgba(255,51,68,.25); } }
+
+  /* ---------- right column: camera tiles + settings ---------- */
+  #right { position: absolute; top: 58px; right: 10px; z-index: 15; width: 196px; display: flex; flex-direction: column; gap: 8px; }
+  #right .panel { padding: 8px; }
+  #camtiles { display: grid; grid-template-columns: 1fr; gap: 3px; margin-top: 5px; }
+  .tile { display: grid; grid-template-columns: 10px 1fr auto 28px; gap: 6px; align-items: center; font-size: 11px; padding: 2px 4px; border-left: 2px solid var(--line); background: rgba(var(--pri-rgb), .04); }
+  .tile .md { color: var(--muted); font-size: 9.5px; } .tile .fps { text-align: right; font-variant-numeric: tabular-nums; }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: #34434f; }
+  .dot.ok { background: var(--ok); box-shadow: 0 0 6px var(--ok); } .dot.warn { background: var(--warn); box-shadow: 0 0 6px var(--warn); }
+  .dot.bad { background: var(--crit); box-shadow: 0 0 6px var(--crit); }
+  .stats { display: grid; grid-template-columns: 1fr auto; gap: 2px 8px; font-size: 11px; margin-top: 5px; font-variant-numeric: tabular-nums; }
+  .stats span:nth-child(odd) { color: var(--muted); }
+  .btns { display: grid; grid-template-columns: 1fr 1fr; gap: 4px; margin-top: 6px; }
+  .btn { font: inherit; font-size: 10px; letter-spacing: .08em; color: var(--text); background: rgba(var(--pri-rgb), .06); border: 1px solid var(--line);
+         padding: 6px 4px; border-radius: 3px; cursor: pointer; text-transform: uppercase; }
+  .btn:hover { border-color: var(--pri); } .btn.on { background: rgba(var(--pri-rgb), .22); border-color: var(--pri); color: #fff; }
+  .btn.wide { grid-column: span 2; }
+  .views { display: grid; grid-template-columns: repeat(5, 1fr); gap: 3px; margin-top: 6px; }
+
+  /* ---------- radar ---------- */
+  #radar-wrap { position: absolute; left: 10px; bottom: 10px; z-index: 15; padding: 6px; border-radius: 50%; }
+  #radar { display: block; width: 210px; height: 210px; }
+  #radar-wrap .lbl { position: absolute; top: -14px; left: 8px; }
+
+  /* ---------- camera strip ---------- */
+  #camstrip { position: absolute; bottom: 10px; left: 240px; right: 190px; z-index: 15; display: flex; gap: 6px; justify-content: center; overflow-x: auto; padding: 4px; }
+  .thumb { position: relative; flex: none; border: 1px solid var(--line); border-radius: 3px; cursor: pointer; background: #000; line-height: 0; }
+  .thumb canvas { width: 128px; height: 72px; }
+  .thumb span { position: absolute; left: 3px; top: 3px; font-size: 9px; line-height: 1; padding: 2px 3px; background: rgba(0,0,0,.6); color: var(--pri); }
+  .thumb.active { border-color: var(--tgt); box-shadow: 0 0 10px rgba(255,43,214,.6); }
+  .thumb:hover { border-color: var(--pri); }
+
+  /* ---------- E-STOP ---------- */
+  #estop { position: absolute; right: 14px; bottom: 14px; z-index: 30; width: 150px; height: 150px; border-radius: 50%; cursor: pointer;
+           font: 800 22px/1.1 var(--mono); letter-spacing: .08em; color: #fff; border: 6px solid #ffd23a;
+           background: radial-gradient(circle at 40% 35%, #ff5a66, #c4001a 60%, #7a0010); box-shadow: 0 0 0 4px #111, 0 0 30px rgba(255,30,50,.6); }
+  #estop small { display: block; font-size: 10px; font-weight: 600; letter-spacing: .12em; opacity: .85; margin-top: 6px; }
+  #estop:active { transform: scale(.96); box-shadow: 0 0 0 4px #111, 0 0 60px rgba(255,30,50,1); }
+
+  /* ---------- target ---------- */
+  #target { position: absolute; top: 140px; left: 50%; transform: translateX(-50%); z-index: 16; display: none; align-items: center; gap: 10px; padding: 6px 12px;
+            border-color: var(--tgt); color: var(--tgt); font-size: 12px; letter-spacing: .1em; }
+  #target b { color: #fff; }
+  #target .btn { border-color: var(--tgt); color: var(--tgt); padding: 3px 8px; }
+
+  /* ---------- labels ---------- */
+  #labels { position: absolute; inset: 0; z-index: 10; pointer-events: none; overflow: hidden; }
+  .plabel { position: absolute; left: 0; top: 0; pointer-events: auto; cursor: pointer; white-space: nowrap; font-size: 11px; line-height: 1.35; padding: 3px 7px;
+            background: rgba(2,8,14,.72); border: 1px solid; border-left-width: 3px; border-radius: 2px; color: #e6f6ff; }
+  .plabel[data-zone="green"] { border-color: var(--ok); } .plabel[data-zone="yellow"] { border-color: var(--warn); }
+  .plabel[data-zone="orange"] { border-color: var(--orange); } .plabel[data-zone="red"] { border-color: var(--crit); }
+  .plabel .rng { color: #fff; font-weight: 700; } .plabel .mods i { font-style: normal; font-size: 9.5px; margin-right: 4px; color: var(--pri); }
+  .plabel .src { font-size: 9px; color: var(--muted); } .plabel .tgt { color: var(--tgt); font-weight: 800; }
+
+  /* ---------- misc ---------- */
+  #toast { position: absolute; top: 190px; left: 50%; transform: translateX(-50%); z-index: 40; padding: 8px 16px; font-size: 13px; letter-spacing: .1em;
+           border: 1px solid var(--pri); background: var(--panel); opacity: 0; transition: opacity .3s; pointer-events: none; }
+  #toast[data-cls="crit"] { border-color: var(--crit); color: var(--crit); } #toast[data-cls="warn"] { border-color: var(--warn); color: var(--warn); }
+  #help { position: absolute; top: 58px; left: 10px; z-index: 18; display: none; padding: 10px 14px; font-size: 11.5px; line-height: 1.7; }
+  #help.open { display: block; }
+  #help kbd { display: inline-block; min-width: 18px; text-align: center; border: 1px solid var(--line); padding: 0 4px; margin-right: 6px; color: var(--pri); }
+  #fatal { display: none; position: absolute; inset: 30% 10% auto; z-index: 50; padding: 16px; border: 1px solid var(--crit); color: var(--crit); background: #100; }
+  body[data-safety="STOP"] #radar-wrap { box-shadow: 0 0 24px rgba(255,51,68,.7); }
+  @media (max-width: 900px) {
+    #safety { top: 92px; min-width: 190px; padding: 4px 10px; } #safety-level { font-size: 18px; }
+    #right { top: 92px; width: 150px; } .tile { font-size: 10px; } #right .views, #right .btns { gap: 2px; }
+    #camstrip { left: 168px; right: 120px; bottom: 6px; justify-content: flex-start; }
+    .thumb canvas { width: 80px; height: 45px; } #radar { width: 140px; height: 140px; }
+    #estop { width: 100px; height: 100px; font-size: 15px; right: 10px; bottom: 10px; }
+  }
+</style>
+</head>
+<body>
+  <div id="viewport"></div>
+  <div id="labels"></div>
+  <div id="fx"></div>
+
+  <header id="topbar">
+    <div class="brand">OMNIVISION<b>360</b></div>
+    <span class="chip" id="mode-chip">ORBIT</span>
+    <span class="chip" id="src-chip" data-state="">…</span>
+    <span class="links">
+      <span class="link" id="link-omni">OMNI</span><span class="link" id="link-video">VIDEO</span><span class="link" id="link-persons">PERSONS</span>
+      <span class="link" id="link-voxels">VOXELS</span><span class="link" id="link-safety">SAFETY</span><span class="link" id="link-pose">POSE</span>
+    </span>
+    <span id="spacer"></span>
+    <span class="chip"><span class="k">BATT</span><span id="batt-track"><span id="batt-fill" style="display:block"></span></span><span id="batt">--%</span></span>
+    <span class="chip"><span class="k">SPD</span><span id="speed">0.00 m/s</span></span>
+    <span class="chip"><span class="k">GPU</span><span id="gpu">--%</span><span id="gputemp">--°C</span></span>
+    <span class="chip"><span class="k">FPS</span><span id="fps">--</span></span>
+    <button class="btn" id="btn-help" style="padding:4px 8px">?</button>
+  </header>
+
+  <section id="safety" class="panel" data-level="UNKNOWN">
+    <div class="lbl">safety guard</div>
+    <div id="safety-level">----</div>
+    <div class="row"><span id="safety-near">-- m</span><span id="safety-vmax">vmax --</span></div>
+    <div class="row"><span id="safety-reason">waiting…</span></div>
+  </section>
+
+  <div id="target" class="panel">TRACK TARGET <b id="target-id"></b><span id="target-range"></span><button class="btn" id="target-clear">CLEAR</button></div>
+
+  <aside id="right">
+    <div class="panel">
+      <div class="lbl">sensors · fps</div>
+      <div id="camtiles"></div>
+      <div class="stats">
+        <span>PERSONS</span><span id="npersons">0</span>
+        <span>VOXELS</span><span id="voxels">0</span>
+      </div>
+    </div>
+    <div class="panel">
+      <div class="lbl">view · display</div>
+      <div class="views">
+        <button class="btn" data-view="1" title="Orbit (1)">1</button><button class="btn" data-view="2" title="Chase (2)">2</button>
+        <button class="btn" data-view="3" title="Top-down (3)">3</button><button class="btn" data-view="4" title="FPV (4, again = next cam)">4</button>
+        <button class="btn" data-view="5" title="Point cloud (5)">5</button>
+      </div>
+      <div class="btns">
+        <button class="btn" id="btn-night" title="N">NIGHT</button>
+        <button class="btn" id="btn-thermal" title="T">THERMAL</button>
+        <button class="btn" id="btn-bowl" title="V">BOWL</button>
+        <button class="btn" id="btn-cloud" title="K">CLOUD</button>
+        <button class="btn" id="btn-bloom" title="B">BLOOM</button>
+        <button class="btn" id="btn-perf" title="P">PERF</button>
+        <button class="btn wide" id="btn-color" title="C">COLOR: RGB</button>
+      </div>
+    </div>
+  </aside>
+
+  <div id="help" class="panel">
+    <div class="lbl">controls</div>
+    <div><kbd>1</kbd>orbit <kbd>2</kbd>chase <kbd>3</kbd>top-down</div>
+    <div><kbd>4</kbd>FPV (again: next camera) <kbd>5</kbd>point cloud</div>
+    <div><kbd>N</kbd>night vision + thermal <kbd>T</kbd>thermal overlay</div>
+    <div><kbd>V</kbd>bowl <kbd>K</kbd>cloud <kbd>C</kbd>cloud color <kbd>B</kbd>bloom <kbd>P</kbd>perf</div>
+    <div>click person = TRACK TARGET · <kbd>Esc</kbd>clear</div>
+    <div>drag = rotate · wheel/pinch = zoom · thumbnail = FPV</div>
+    <div style="color:var(--crit)"><kbd>Space</kbd>E-STOP (safety_guard /stop)</div>
+  </div>
+
+  <div id="radar-wrap" class="panel"><span class="lbl">radar · 10 m</span><canvas id="radar" width="220" height="220"></canvas></div>
+  <div id="camstrip"></div>
+  <button id="estop" title="Emergency stop (Space)">E-STOP<small>SPACE</small></button>
+  <div id="toast"></div>
+  <div id="fatal"></div>
+
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/loaders/ColladaLoader.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/shaders/CopyShader.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/shaders/LuminosityHighPassShader.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/postprocessing/EffectComposer.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/postprocessing/RenderPass.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/postprocessing/ShaderPass.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/postprocessing/UnrealBloomPass.js"></script>
+  <script type="module" src="/static/omni.js"></script>
+</body>
+</html>

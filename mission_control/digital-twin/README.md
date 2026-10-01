@@ -120,3 +120,27 @@ curl http://localhost:9110/api/pose_proxy
 curl -X POST http://localhost:9110/api/goto -H "Content-Type: application/json" -d "{\"x\": 1.0, \"y\": 2.0}"
 curl http://localhost:9110/api/localization_confidence
 ```
+
+## OmniView — OmniVision 360 console (`/omni`)
+
+`GET /omni` serves `static/omni.html` (+ `static/omni.js`, modules in `static/omni/`).
+Vanilla JS + three.js r128 (cdnjs) + examples addons (jsdelivr: ColladaLoader, EffectComposer,
+UnrealBloomPass). No build. Contract: `../omni/CONTRACTS.md` §E.
+
+- **Sources:** omni `:9114` (`GET /rig`, `WS /ws/video|persons|voxels`, `GET /health`), safety_guard
+  `:9115` (`GET /state` 5 Hz, `POST /stop`), pose/battery from this pillar's `WS /ws/live`.
+  Host override: `?omni=host[:port]&safety=host[:port]` (default `location.hostname`).
+- **Demo:** `/omni?demo=1`, or automatic when `:9114/rig` is unreachable (re-probed every 15 s).
+  Synthetic night courtyard rendered through the same camera models → fisheye textures, moving persons,
+  growing OVX1 point cloud, safety level changes.
+- **Modules:** `frames.js` (ROS↔three, KB fisheye/pinhole), `bowl.js` (GPU surround-view shader,
+  feathered blend, per-cam gain, thermal inferno overlay), `robot.js` (URDF + DAE, box-dog fallback),
+  `pointcloud.js` (OVX1 decode, upsert by voxel key, doubling buffers), `persons.js` (holograms, labels,
+  velocity, 2 s prediction, click → TRACK TARGET), `hud.js` (tiles, radar, camera strip), `views.js`,
+  `net.js` (reconnect/backoff), `demo.js`.
+- **Keys:** `1-5` orbit/chase/top/FPV(again = next cam)/point cloud · `N` night+thermal · `T` thermal ·
+  `V` bowl · `K` cloud · `C` cloud color (RGB/hot/height) · `B` bloom · `P` perf · `Esc` clear target ·
+  **`Space` E-STOP** (→ `:9115/stop` + `/api/estop`).
+- **Frames:** voxel z is treated as body-centric (floor ≈ −0.33 m, `BASE_HEIGHT` in `frames.js`).
+- **TODO:** TRACK TARGET only emits `omni:track-target` (window CustomEvent) — no pursuit endpoint in the
+  contract yet; live joint angles are read from `/ws/live` `joints|motor_q` if present (else idle anim).
