@@ -39,6 +39,7 @@ konténer nélkül futtatja).
 | follow_executor | 9113 |
 | omni (360 kamera + LiDAR fúzió) | 9114 |
 | safety_guard (ember-tudatos sebességkorlát) | 9115 |
+| mission (3D misszió-végrehajtó) | 9116 |
 | redis (event bus) | 6379 |
 | remote (tailscale) | nincs saját HTTP port |
 
@@ -67,6 +68,8 @@ Ismert csatornák (bővíthető):
 - `mc.omni.persons` — omni publikálja (360° emberek, base frame, gid), a `safety_guard`, `mapping`, `navigation` és UI fogyasztja
 - `mc.omni.health` — omni kameránkénti fps/drop, GPU, büdzsé-szint
 - `mc.safety.state` — safety_guard publikálja 20 Hz (`CLEAR|CAUTION|SLOW|STOP`, vmax)
+- `mc.mission.state` / `mc.mission.event` / `mc.mission.alert` — mission pillér (állapot, átmenetek, szabály-riasztások)
+- `mc.omni.gesture` — omni gesztus-esemény `{gid, gesture, t}`
 
 ## Fájlszerkezet pillérenként
 
