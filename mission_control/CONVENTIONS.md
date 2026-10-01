@@ -36,6 +36,9 @@ konténer nélkül futtatja).
 | digital-twin (static viewer) | 9110 |
 | fleet | 9111 |
 | perception (person 3D tracking) | 9112 |
+| follow_executor | 9113 |
+| omni (360 kamera + LiDAR fúzió) | 9114 |
+| safety_guard (ember-tudatos sebességkorlát) | 9115 |
 | redis (event bus) | 6379 |
 | remote (tailscale) | nincs saját HTTP port |
 
@@ -61,6 +64,9 @@ Ismert csatornák (bővíthető):
 - `mc.core.anomaly` — bármelyik pillér publikálhat (akku, IMU-lökés, hő, folyamat-halál), a `blackbox` erre iratkozik fel és exportál
 - `mc.orchestration.task_event` — task indul/lép/kész/hiba
 - `mc.perception.persons` — perception publikálja minden feldolgozott képkockánál (emberek 3D pozíciója, track_id, target_id)
+- `mc.omni.persons` — omni publikálja (360° emberek, base frame, gid), a `safety_guard`, `mapping`, `navigation` és UI fogyasztja
+- `mc.omni.health` — omni kameránkénti fps/drop, GPU, büdzsé-szint
+- `mc.safety.state` — safety_guard publikálja 20 Hz (`CLEAR|CAUTION|SLOW|STOP`, vmax)
 
 ## Fájlszerkezet pillérenként
 
