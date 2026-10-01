@@ -1,0 +1,85 @@
+# OmniVision 360 camera rig (MOCK: every source is synthetic). Generated defaults -- ALL INTRINSICS AND
+# EXTRINSICS ARE UNCALIBRATED ESTIMATES until CAL-1/CAL-2 (see NERO_GO2/docs/21).
+# Frames: base = x fwd, y left, z up (m); cam = OpenCV (z fwd, x right, y down).
+# T_base_cam: p_base = T_base_cam @ p_cam. Instead of T_base_cam you may give
+#   mount: {xyz: [x, y, z], yaw_deg: .., pitch_deg: .. (down > 0), roll_deg: ..}
+# Camera order below = cam_idx of the /ws/video stream. Keep it stable.
+name: go2_omni_mock
+ground_z: -0.32        # ground plane in base frame (Go2 standing body height)
+cameras:
+  rgb_front:   # front fisheye, ~190 deg
+    modality: rgb
+    model: fisheye
+    width: 1280
+    height: 720
+    max_fov_deg: 200
+    K: [[400, 0, 640], [0, 400, 360], [0, 0, 1]]   # uncalibrated estimate
+    D: [-0.02, 0.005, -0.001, 0]   # uncalibrated estimate (k1..k4)
+    # mount: {xyz: [0.25, 0.0, 0.12], yaw_deg: 0, pitch_deg: 12}  (estimate)
+    T_base_cam: [[0, -0.207912, 0.978148, 0.25], [-1, 0, 0, 0], [0, -0.978148, -0.207912, 0.12], [0, 0, 0, 1]]
+    source: {type: mock, fps: 10, seed: 9}
+  rgb_left:   # left side
+    modality: rgb
+    model: fisheye
+    width: 1280
+    height: 720
+    max_fov_deg: 200
+    K: [[400, 0, 640], [0, 400, 360], [0, 0, 1]]   # uncalibrated estimate
+    D: [-0.02, 0.005, -0.001, 0]   # uncalibrated estimate (k1..k4)
+    # mount: {xyz: [0.05, 0.15, 0.12], yaw_deg: 90, pitch_deg: 12}  (estimate)
+    T_base_cam: [[1, 0, 0, 0.05], [0, -0.207912, 0.978148, 0.15], [0, -0.978148, -0.207912, 0.12], [0, 0, 0, 1]]
+    source: {type: mock, fps: 10, seed: 8}
+  rgb_right:   # right side
+    modality: rgb
+    model: fisheye
+    width: 1280
+    height: 720
+    max_fov_deg: 200
+    K: [[400, 0, 640], [0, 400, 360], [0, 0, 1]]   # uncalibrated estimate
+    D: [-0.02, 0.005, -0.001, 0]   # uncalibrated estimate (k1..k4)
+    # mount: {xyz: [0.05, -0.15, 0.12], yaw_deg: -90, pitch_deg: 12}  (estimate)
+    T_base_cam: [[-1, 0, 0, 0.05], [0, 0.207912, -0.978148, -0.15], [0, -0.978148, -0.207912, 0.12], [0, 0, 0, 1]]
+    source: {type: mock, fps: 10, seed: 9}
+  rgb_rear:   # rear
+    modality: rgb
+    model: fisheye
+    width: 1280
+    height: 720
+    max_fov_deg: 200
+    K: [[400, 0, 640], [0, 400, 360], [0, 0, 1]]   # uncalibrated estimate
+    D: [-0.02, 0.005, -0.001, 0]   # uncalibrated estimate (k1..k4)
+    # mount: {xyz: [-0.25, 0.0, 0.12], yaw_deg: 180, pitch_deg: 12}  (estimate)
+    T_base_cam: [[0, 0.207912, -0.978148, -0.25], [1, 0, 0, 0], [0, -0.978148, -0.207912, 0.12], [0, 0, 0, 1]]
+    source: {type: mock, fps: 10, seed: 8}
+  th_front_narrow:   # thermal narrow ~32 deg HFOV (far)
+    modality: thermal
+    model: pinhole
+    width: 256
+    height: 192
+    K: [[446.39, 0, 128], [0, 446.39, 96], [0, 0, 1]]   # uncalibrated estimate
+    D: [0, 0, 0, 0, 0]   # uncalibrated estimate (k1,k2,p1,p2,k3)
+    # mount: {xyz: [0.27, 0.03, 0.15], yaw_deg: 0, pitch_deg: 3}  (estimate)
+    T_base_cam: [[0, -0.052336, 0.99863, 0.27], [-1, 0, 0, 0.03], [0, -0.99863, -0.052336, 0.15], [0, 0, 0, 1]]
+    source: {type: mock, fps: 9, seed: 15}
+  th_front_wide:   # thermal wide ~56 deg HFOV (near)
+    modality: thermal
+    model: pinhole
+    width: 256
+    height: 192
+    K: [[240.73, 0, 128], [0, 240.73, 96], [0, 0, 1]]   # uncalibrated estimate
+    D: [-0.05, 0, 0, 0, 0]   # uncalibrated estimate (k1,k2,p1,p2,k3)
+    # mount: {xyz: [0.27, -0.03, 0.15], yaw_deg: 0, pitch_deg: 8}  (estimate)
+    T_base_cam: [[0, -0.139173, 0.990268, 0.27], [-1, 0, 0, -0.03], [0, -0.990268, -0.139173, 0.15], [0, 0, 0, 1]]
+    source: {type: mock, fps: 9, seed: 13}
+  tof_rear:   # MaixSense A010 ToF 100x100, ~70x60 deg, 0.2-2.5 m
+    modality: depth
+    model: pinhole
+    width: 100
+    height: 100
+    K: [[71.41, 0, 50], [0, 86.6, 50], [0, 0, 1]]   # uncalibrated estimate
+    D: [0, 0, 0, 0, 0]   # uncalibrated estimate (k1,k2,p1,p2,k3)
+    # mount: {xyz: [-0.27, 0.0, 0.08], yaw_deg: 180, pitch_deg: 20}  (estimate)
+    T_base_cam: [[0, 0.34202, -0.939693, -0.27], [1, 0, 0, 0], [0, -0.939693, -0.34202, 0.08], [0, 0, 0, 1]]
+    source: {type: mock, fps: 10, seed: 8}
+lidar:
+  source: {type: mock}   # robot_client | mock ; points already in base frame

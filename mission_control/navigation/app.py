@@ -43,6 +43,26 @@ except ImportError:  # pragma: no cover
 PILLAR = "navigation"
 PORT = 9103
 
+SAFETY_URL = os.environ.get("SAFETY_URL", "")  # empty = legacy direct robot.move
+
+
+def _safe_move(robot, vx: float, vy: float, vyaw: float) -> None:
+    """Send a move through safety_guard when configured (SAF-4), else directly."""
+    if not SAFETY_URL:
+        robot.move(vx, vy, vyaw)
+        return
+    r = requests.post(f"{SAFETY_URL}/move", json={"vx": vx, "vy": vy, "vyaw": vyaw, "source": PILLAR}, timeout=0.3)
+    r.raise_for_status()  # 409 not armed / 502 -> caller's existing error path
+
+
+def _safe_stop(robot) -> None:
+    if SAFETY_URL:
+        try:
+            requests.post(f"{SAFETY_URL}/stop", json={"source": PILLAR}, timeout=0.3)
+        except Exception:
+            pass
+    robot.stop()
+
 MAPPING_URL = os.environ.get("MAPPING_URL", "http://localhost:9102")
 ROBOT_RADIUS_M = float(os.environ.get("ROBOT_RADIUS_M", "0.25"))
 
@@ -177,7 +197,7 @@ class NavService:
         t = self._thread
         if t is not None:
             t.join(timeout=5.0)
-        self.robot.stop()
+        _safe_stop(self.robot)
         if self.state in ("planning", "moving", "blocked"):
             self.state = "cancelled"
         log_event("info", "navigation cancelled", nav_id=self.nav_id)
@@ -292,7 +312,7 @@ class NavService:
 
                 hit, why = _obstacle_ahead(self.robot, pose)
                 if hit:
-                    self.robot.stop()
+                    _safe_stop(self.robot)
                     if self.state != "blocked":
                         self.state = "blocked"
                         self._publish_anomaly("safety brake engaged", nav_id=nav_id,
@@ -304,20 +324,20 @@ class NavService:
                 vyaw = max(-1.0, min(1.0, YAW_KP * yaw_err))
                 vx = speed * max(0.15, 1.0 - abs(yaw_err) / math.pi)
                 try:
-                    self.robot.move(vx, 0.0, vyaw)
+                    _safe_move(self.robot, vx, 0.0, vyaw)
                 except Exception as exc:
                     self._fail(nav_id, f"move command refused: {exc}")
                     return False
                 time.sleep(TICK_S)
 
-        self.robot.stop()
+        _safe_stop(self.robot)
         return True
 
     def _fail(self, nav_id: str, msg: str) -> None:
         if self.nav_id == nav_id:
             self.state = "failed"
             self.error = msg
-        self.robot.stop()
+        _safe_stop(self.robot)
         log_event("error", msg, nav_id=nav_id)
 
 

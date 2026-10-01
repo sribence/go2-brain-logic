@@ -39,6 +39,8 @@ from typing import Optional
 
 PERCEPTION = os.environ.get("PERCEPTION_URL", "http://127.0.0.1:9112")
 MOTION = os.environ.get("MOTION_URL", "http://127.0.0.1:9102")
+# Move/stop go through safety_guard when SAFETY_URL is set; health/odom stay on mc_motion.
+MOVE_URL = os.environ.get("SAFETY_URL", MOTION)
 PORT = int(os.environ.get("EXECUTOR_PORT", "9113"))
 RATE_HZ = float(os.environ.get("RATE_HZ", "20"))
 MAX_RESULT_AGE_S = float(os.environ.get("MAX_RESULT_AGE_S", "0.4"))
@@ -175,14 +177,14 @@ class Executor:
             self.log(f"{self.reason} -> {reason}")
         self.reason = reason
         if send:
-            if _post(f"{MOTION}/move", {"vx": vx, "vy": 0.0, "vyaw": vyaw}) is None:
+            if _post(f"{MOVE_URL}/move", {"vx": vx, "vy": 0.0, "vyaw": vyaw, "source": "follow_executor"}) is None:
                 self.reason = "move rejected/unreachable"
             else:
                 self.moving = True
                 self.last_cmd = (vx, vyaw)
                 self.sent += 1
         elif self.moving:
-            _post(f"{MOTION}/stop")
+            _post(f"{MOVE_URL}/stop")
             self.moving = False
             self.last_cmd = (0.0, 0.0)
             self.stops += 1
@@ -197,7 +199,7 @@ class Executor:
             except Exception as exc:          # never die silently mid-motion
                 self.log(f"tick error: {exc}")
                 if self.moving:
-                    _post(f"{MOTION}/stop")
+                    _post(f"{MOVE_URL}/stop")
                     self.moving = False
             time.sleep(max(0.0, period - (time.time() - t0)))
 

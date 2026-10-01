@@ -45,6 +45,7 @@ class PersonTrack:
     range_src: str = "ground_plane"  # lidar | tof | ground_plane | thermal_size
     age_s: float = 0.0
     last_seen_t: float = 0.0
+    height_m: float = 0.0  # estimated standing height above ground, 0 = unknown
 
     @property
     def range_m(self) -> float:
@@ -52,7 +53,7 @@ class PersonTrack:
 
     def to_dict(self) -> dict:
         d = asdict(self)
-        for k in ("x", "y", "z", "vx", "vy", "conf", "age_s"):
+        for k in ("x", "y", "z", "vx", "vy", "conf", "age_s", "height_m"):
             d[k] = round(float(d[k]), 3)
         d["range_m"] = round(self.range_m, 3)
         return d

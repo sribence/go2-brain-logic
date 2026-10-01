@@ -52,6 +52,7 @@ services:
       <<: *common-env
       ROBOT_CLIENT_MODE: remote
       CORE_URL: http://core:9101
+      SAFETY_URL: ${SAFETY_URL:-http://safety_guard:9115}
     expose:
       - "9102"
     volumes:
@@ -68,6 +69,7 @@ services:
       <<: *common-env
       ROBOT_CLIENT_MODE: remote
       CORE_URL: http://core:9101
+      SAFETY_URL: ${SAFETY_URL:-http://safety_guard:9115}
       MAPPING_URL: http://mapping:9102
     expose:
       - "9103"
@@ -176,6 +178,45 @@ services:
       - redis
       - core
 
+  omni:
+    build:
+      context: .
+      dockerfile: omni/Dockerfile
+    environment:
+      <<: *common-env
+      ROBOT_CLIENT_MODE: remote
+      CORE_URL: http://core:9101
+      OMNI_MOCK: ${OMNI_MOCK:-1}
+    ports:
+      - "9114:9114"
+    volumes:
+      - omni_logs:/app/omni/logs
+    # Élesben (Jetsonon): runtime: nvidia + a 4 USB RGB-kamera passthrough, pl.:
+    # devices:
+    #   - /dev/v4l/by-id/<rgb_front>:/dev/video0
+    depends_on:
+      - redis
+      - core
+
+  safety_guard:
+    build:
+      context: .
+      dockerfile: safety_guard/Dockerfile
+    environment:
+      <<: *common-env
+      ROBOT_CLIENT_MODE: remote
+      CORE_URL: http://core:9101
+      MOTION_URL: ${MOTION_URL:-http://host.docker.internal:9102}
+      OMNI_URL: http://omni:9114
+    ports:
+      - "9115:9115"
+    volumes:
+      - safety_guard_logs:/app/safety_guard/logs
+    depends_on:
+      - redis
+      - core
+      - omni
+
   digital-twin:
     build:
       context: .
@@ -220,4 +261,6 @@ volumes:
   blackbox_buffer:
   blackbox_incidents:
   blackbox_logs:
+  omni_logs:
+  safety_guard_logs:
   tailscale_state:

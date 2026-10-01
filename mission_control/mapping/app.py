@@ -46,6 +46,31 @@ except ImportError:  # pragma: no cover
 PILLAR = "mapping"
 PORT = 9102
 
+SAFETY_URL = os.environ.get("SAFETY_URL", "")  # empty = legacy direct robot.move
+
+
+def _safety_post(path: str, body: dict) -> None:
+    req = urllib.request.Request(f"{SAFETY_URL}{path}", data=json.dumps(body).encode(),
+                                 headers={"Content-Type": "application/json"}, method="POST")
+    urllib.request.urlopen(req, timeout=0.3).close()  # HTTPError on 409/502
+
+
+def _safe_move(robot, vx: float, vy: float, vyaw: float) -> None:
+    """Send a move through safety_guard when configured (SAF-4), else directly."""
+    if not SAFETY_URL:
+        robot.move(vx, vy, vyaw)
+        return
+    _safety_post("/move", {"vx": vx, "vy": vy, "vyaw": vyaw, "source": PILLAR})
+
+
+def _safe_stop(robot) -> None:
+    if SAFETY_URL:
+        try:
+            _safety_post("/stop", {"source": PILLAR})
+        except Exception:
+            pass
+    robot.stop()
+
 GRID_WIDTH = int(os.environ.get("MAP_WIDTH", "200"))
 GRID_HEIGHT = int(os.environ.get("MAP_HEIGHT", "200"))
 GRID_RESOLUTION = float(os.environ.get("MAP_RESOLUTION", "0.05"))
@@ -283,7 +308,7 @@ class MappingService:
         t = self._explore_thread
         if t is not None:
             t.join(timeout=5.0)
-        self.robot.stop()
+        _safe_stop(self.robot)
         self._state = "idle"
         log_event("info", "exploration stopped")
 
@@ -323,7 +348,7 @@ class MappingService:
             self._last_error = str(exc)
             log_event("error", "exploration loop crashed", error=str(exc))
         finally:
-            self.robot.stop()
+            _safe_stop(self.robot)
             self._state = "idle"
             self._maybe_publish(force=True)
 
@@ -352,7 +377,7 @@ class MappingService:
                     break
                 if time.time() - t_start > WAYPOINT_TIMEOUT_S:
                     log_event("warn", "waypoint timeout, replanning", x=wx, y=wy)
-                    self.robot.stop()
+                    _safe_stop(self.robot)
                     return True
 
                 target_yaw = math.atan2(dy, dx)
@@ -366,7 +391,7 @@ class MappingService:
                 vyaw = max(-1.0, min(1.0, YAW_KP * yaw_err))
                 vx = speed * max(0.15, 1.0 - abs(yaw_err) / math.pi)
                 try:
-                    self.robot.move(vx, 0.0, vyaw)
+                    _safe_move(self.robot, vx, 0.0, vyaw)
                 except Exception as exc:
                     self._last_error = f"move command refused: {exc}"
                     log_event("error", self._last_error)
@@ -376,7 +401,7 @@ class MappingService:
                 self._maybe_publish()
 
                 time.sleep(TICK_S)
-        self.robot.stop()
+        _safe_stop(self.robot)
         return True
 
 

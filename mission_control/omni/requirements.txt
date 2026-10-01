@@ -1,0 +1,6 @@
+# numpy + opencv come from the base image on the Jetson (GStreamer-enabled
+# OpenCV); the dev image installs them via the Dockerfile's EXTRA_REQS.
+fastapi
+uvicorn
+pyyaml
+redis

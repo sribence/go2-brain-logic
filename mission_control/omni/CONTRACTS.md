@@ -128,3 +128,14 @@ class PersonTrack:       # globális, base frame
 - Minden új logika tiszta, egységtesztelhető függvényben; tesztek a `mission_control/tests/` alatt, a meglévő 105 teszt maradjon zöld.
 - Mozgásparancs CSAK a `safety_guard`-on át. Armolni semmi nem armol.
 - Nem commitolsz, nem pusholsz: a fájlokat a koordinátor commitolja.
+
+## 6. Eltérések / kiegészítések (integráció után, 2026-10-01)
+> ELTÉRÉS: `PersonTrack.height_m` (álló magasság a talajtól, 0 = ismeretlen). A `z` a test **középpontja**, nem magasság. A `safety_guard` gyerek-szabálya (`< 1.3 m` → zónák ×1.5) csak a `height_m`-et használja (`child_from_z=False`).
+> ELTÉRÉS: `/rig` válasz: `{order, cameras:[{id, index, modality, width, height, model, K, D, max_fov_deg, T_base_cam, yaw_deg}]}`. `/ws/video` paraméterek: `?cams=a,b&fps=&width=`.
+> ELTÉRÉS: `project_base` érvénytelen pontra `uv = -1`; mindig a `valid` maszkkal szűrj.
+> ELTÉRÉS: `PursuitController.step(target, odom, now) -> (vx, vy, vyaw, state)`.
+> ELTÉRÉS: `social_cost_grid` lapos, row-major uint8 tömb (`width*height`).
+> ELTÉRÉS: OVX1-ben az evictált voxelek nem jelennek meg deltában; a kliens a következő snapshotnál tisztul.
+> KIEGÉSZÍTÉS: `safety_guard` a `pursuit`/`follow`/`follow_executor` forrásnál 2.5 m-en belül nullázza a közelítő lineáris parancsot.
+> INTEGRÁLVA: `navigation`, `mapping` (`_safe_move`/`_safe_stop`, `SAFETY_URL`) és `follow_executor` (`MOVE_URL`) a guardon át mozgat; compose: `omni`, `safety_guard` szolgáltatás.
+> ISMERT: `mc_motion` default `MOTION_PORT=9102` ütközik a `mapping` portjával — külön hoston fut, compose-ban `MOTION_URL`-lel kell megadni.
