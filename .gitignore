@@ -1,3 +1,5 @@
 __pycache__/
 *.pyc
 *.whl
+mission_control/omni/incidents/
+mission_control/mission/data/*.tmp
