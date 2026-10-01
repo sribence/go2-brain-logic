@@ -47,6 +47,16 @@ REMOTE_DEADZONE = float(os.environ.get("REMOTE_DEADZONE", "0.15"))
 # useful if the remote publishes while idle; check /health "remote" first.
 REQUIRE_REMOTE = os.environ.get("REQUIRE_REMOTE", "0") == "1"
 REMOTE_MAX_AGE_S = float(os.environ.get("REMOTE_MAX_AGE_S", "1.0"))
+# Feature flags (mission/CONTRACT.md section 4). All off by default: with the
+# defaults every pre-existing route behaves exactly as before.
+#   MOTION_ALLOW_SPRINT=1  /move honours body "sprint": true (sent only by
+#                          safety_guard when it permitted a mission sprint) and
+#                          clamps |vx| to MAX_VX_SPRINT instead of MAX_VX.
+#   MAX_VX_SPRINT          default = MAX_VX (no change unless configured).
+#   MOTION_ALLOW_GAIT=1    enables POST /gait and POST /speed_level (else 403).
+MOTION_ALLOW_SPRINT = os.environ.get("MOTION_ALLOW_SPRINT", "0") == "1"
+MAX_VX_SPRINT = float(os.environ.get("MAX_VX_SPRINT", str(MAX_VX)))
+MOTION_ALLOW_GAIT = os.environ.get("MOTION_ALLOW_GAIT", "0") == "1"
 
 app = Flask(__name__)
 
@@ -195,6 +205,14 @@ def _clamp(v, limit):
     return max(-limit, min(limit, v))
 
 
+def _vx_limit(body):
+    """MAX_VX, or MAX_VX_SPRINT only when MOTION_ALLOW_SPRINT=1 and the body
+    carries the boolean sprint: true (anything else, e.g. "1", is ignored)."""
+    if MOTION_ALLOW_SPRINT and isinstance(body, dict) and body.get("sprint") is True:
+        return MAX_VX_SPRINT
+    return MAX_VX
+
+
 def _stop_now(reason):
     """Best effort zero-velocity. Never raises: this runs on the failure path."""
     try:
@@ -307,14 +325,14 @@ def arm():
 
 @app.route("/move", methods=["POST"])
 def move():
-    global _last_cmd_t, _last_cmd
+    global _last_cmd_t, _last_cmd, _armed_t
     body = request.get_json(silent=True) or {}
     with _lock:
         if _sport is None:
             return jsonify({"error": f"SportClient nem elerheto: {_sdk_error}"}), 503
         if not _armed:
             return jsonify({"error": "a robot nincs elesitve"}), 409
-        vx = _clamp(body.get("vx"), MAX_VX)
+        vx = _clamp(body.get("vx"), _vx_limit(body))
         vy = _clamp(body.get("vy"), MAX_VY)
         vyaw = _clamp(body.get("vyaw"), MAX_VYAW)
         sport = _sport
@@ -472,6 +490,7 @@ def led_preset(name):
 @app.route("/action/<name>", methods=["POST"])
 def action(name):
     """Posture and gesture commands."""
+    global _armed_t
     if name in ("search_light", "light"):
         target = 0 if _led_switch else 1
         err = _set_led(switch=target, brightness=10 if target else None)
@@ -527,6 +546,168 @@ def action(name):
         _armed_t = time.time()
     _log("info", f"parancs: {name} (kod={code})")
     return jsonify({"ok": True, "action": name, "code": code})
+
+
+# ---------------------------------------------------------------------------
+# Capabilities, gait and speed level (mission/CONTRACT.md section 4).
+# unitree_sdk2py go2 SportClient method sets differ by SDK revision
+# (github.com/unitreerobotics/unitree_sdk2_python, go2/sport/sport_client.py):
+#   <= 3d497a6 (2025-01): SwitchGait(t:int), EconomicGait(flag), FreeWalk(flag),
+#                         SpeedLevel(level:int), FrontJump(), FrontPounce(), ...
+#   >= 026978e (2025-07): SwitchGait/EconomicGait removed; FreeWalk(),
+#                         ClassicWalk(flag), TrotRun(), StaticWalk(),
+#                         SpeedLevel(level:int), ...
+# So nothing is assumed: /capabilities introspects the live client and /gait
+# calls a method with `enable` only when its signature takes one argument.
+
+CAP_METHODS = ("Move", "StopMove", "SpeedLevel", "SwitchGait", "EconomicGait", "FreeWalk", "ClassicWalk",
+               "TrotRun", "StaticWalk", "FreeBound", "FreeJump", "FreeAvoid", "WalkUpright", "CrossStep",
+               "FrontJump", "FrontPounce", "FrontFlip", "BackFlip", "LeftFlip", "HandStand",
+               "Hello", "Stretch", "Sit", "RiseSit", "StandUp", "StandDown", "RecoveryStand",
+               "BalanceStand", "Damp", "Dance1", "Dance2", "Heart", "FingerHeart", "Scrape",
+               "WiggleHips", "Content", "Pose", "Euler", "SwitchJoystick", "AutoRecoverySet",
+               "AutoRecoveryGet", "SwitchAvoidMode", "GetState", "GetSpeedLevel")
+
+# mode -> SportClient method. Acrobatic modes (FreeBound/FreeJump/HandStand/
+# WalkUpright/CrossStep) are deliberately not reachable.
+GAIT_MODES = {
+    "free_walk": "FreeWalk",
+    "classic_walk": "ClassicWalk",
+    "trot_run": "TrotRun",
+    "static_walk": "StaticWalk",
+    "economic": "EconomicGait",
+    "switch_gait": "SwitchGait",   # older SDKs only; needs integer "value"
+}
+# Unitree docs: -1 slow, 0 normal, 1 fast. Not verified on this firmware.
+SPEED_LEVELS = (-1, 0, 1)
+
+
+def _arity(fn):
+    """Number of positional params of a bound method, or None if unknown."""
+    try:
+        import inspect
+        return len([p for p in inspect.signature(fn).parameters.values()
+                    if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD)])
+    except (TypeError, ValueError):
+        return None
+
+
+def _capabilities(sport):
+    methods = {}
+    for m in CAP_METHODS:
+        fn = getattr(sport, m, None) if sport is not None else None
+        methods[m] = {"exists": callable(fn), "arity": _arity(fn) if callable(fn) else None}
+    return methods
+
+
+def _motion_idle():
+    """No live velocity command (watchdog window) and last command zero."""
+    live = _last_cmd_t and (time.time() - _last_cmd_t) <= COMMAND_TIMEOUT_S
+    return not live or all(v == 0.0 for v in _last_cmd)
+
+
+def _gated_sport():
+    """Common guard for /gait and /speed_level: flag, SDK, armed, idle.
+    Returns (sport, None) or (None, (response, status))."""
+    if not MOTION_ALLOW_GAIT:
+        return None, (jsonify({"error": "MOTION_ALLOW_GAIT=0: tiltva"}), 403)
+    with _lock:
+        if _sport is None:
+            return None, (jsonify({"error": f"SportClient nem elerheto: {_sdk_error}"}), 503)
+        if not _armed:
+            return None, (jsonify({"error": "a robot nincs elesitve"}), 409)
+        if not _motion_idle():
+            return None, (jsonify({"error": "mozgas kozben nem valthato"}), 409)
+        return _sport, None
+
+
+@app.route("/capabilities")
+def capabilities():
+    with _lock:
+        sport = _sport
+        sdk_error = _sdk_error
+    try:
+        import unitree_sdk2py
+        sdk_version = getattr(unitree_sdk2py, "__version__", None)
+    except Exception:
+        sdk_version = None
+    return jsonify({"sdk_ready": sport is not None, "sdk_error": sdk_error, "sdk_version": sdk_version,
+                    "methods": _capabilities(sport),
+                    "gait_modes": {k: (sport is not None and callable(getattr(sport, v, None)))
+                                   for k, v in GAIT_MODES.items()},
+                    "speed_levels": list(SPEED_LEVELS),
+                    "limits": {"max_vx": MAX_VX, "max_vy": MAX_VY, "max_vyaw": MAX_VYAW,
+                               "max_vx_sprint": MAX_VX_SPRINT},
+                    "flags": {"allow_sprint": MOTION_ALLOW_SPRINT, "allow_gait": MOTION_ALLOW_GAIT},
+                    "command_timeout_s": COMMAND_TIMEOUT_S})
+
+
+@app.route("/gait", methods=["POST"])
+def gait():
+    """Body {"mode": <GAIT_MODES key>, "enable": true, "value": int (switch_gait)}."""
+    global _armed_t
+    body = request.get_json(silent=True) or {}
+    sport, err = _gated_sport()
+    if err:
+        return err
+    mode = body.get("mode")
+    meth = GAIT_MODES.get(mode) if isinstance(mode, str) else None
+    if meth is None:
+        return jsonify({"error": f"ismeretlen mode: {mode!r}", "known": sorted(GAIT_MODES)}), 422
+    fn = getattr(sport, meth, None)
+    if not callable(fn):
+        return jsonify({"error": f"ez az SDK nem ismeri: {meth}"}), 501
+    enable = body.get("enable", True)
+    if not isinstance(enable, bool):
+        return jsonify({"error": "enable: true|false"}), 422
+    n = _arity(fn)
+    if meth == "SwitchGait":
+        val = body.get("value")
+        if not isinstance(val, int) or isinstance(val, bool) or not 0 <= val <= 4 or n != 1:
+            return jsonify({"error": "switch_gait: egesz 'value' 0-4 kell"}), 422
+        args = (val,)
+    elif n == 0:
+        if not enable:
+            return jsonify({"error": f"{meth}() nem kapcsolhato ki, valassz masik modot"}), 422
+        args = ()
+    elif n == 1:
+        args = (enable,)
+    else:
+        return jsonify({"error": f"{meth} szignatura ismeretlen (arity={n})"}), 501
+    try:
+        code = fn(*args)
+    except Exception as exc:
+        _log("error", f"gait {mode} hiba: {exc}")
+        return jsonify({"error": str(exc)}), 500
+    with _lock:
+        _armed_t = time.time()
+    _log("info", f"gait: {mode} -> {meth}{args} (kod={code})")
+    return jsonify({"ok": code == 0, "mode": mode, "method": meth, "args": list(args), "code": code})
+
+
+@app.route("/speed_level", methods=["POST"])
+def speed_level():
+    """Body {"level": -1|0|1}."""
+    global _armed_t
+    body = request.get_json(silent=True) or {}
+    sport, err = _gated_sport()
+    if err:
+        return err
+    level = body.get("level")
+    if not isinstance(level, int) or isinstance(level, bool) or level not in SPEED_LEVELS:
+        return jsonify({"error": f"level: {list(SPEED_LEVELS)}"}), 422
+    fn = getattr(sport, "SpeedLevel", None)
+    if not callable(fn):
+        return jsonify({"error": "ez az SDK nem ismeri: SpeedLevel"}), 501
+    try:
+        code = fn(level)
+    except Exception as exc:
+        _log("error", f"SpeedLevel hiba: {exc}")
+        return jsonify({"error": str(exc)}), 500
+    with _lock:
+        _armed_t = time.time()
+    _log("info", f"speed_level: {level} (kod={code})")
+    return jsonify({"ok": code == 0, "level": level, "code": code})
 
 
 if __name__ == "__main__":

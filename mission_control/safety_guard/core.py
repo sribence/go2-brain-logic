@@ -88,6 +88,20 @@ class SafetyConfig:
     follow_min_m: float = 2.5
     # below this the linear command counts as "not moving" (no stretch)
     eps_v: float = 1e-3
+    # -- mission sprint (mission/CONTRACT.md section 4) ------------------------
+    # Only source "mission" + profile "sprint", with a live dead-man, level
+    # CLEAR, battery known and > sprint_battery_min_pct, fresh LiDAR + person
+    # data and nobody in the corridor ahead. Env alias: SPRINT_VMAX.
+    sprint_vmax: float = 1.5
+    sprint_battery_min_pct: float = 30.0
+    sprint_corridor_half_w_m: float = 1.5
+    sprint_corridor_len_m: float = 8.0
+    # -- gated actions (jump / pounce) ------------------------------------------
+    action_person_min_m: float = 3.5     # nobody within this range (any direction)
+    action_still_s: float = 0.5          # |cmd| below action_still_eps for this long
+    action_still_eps: float = 0.05
+    action_front_clear_m: float = 1.0    # LiDAR free distance ahead for a jump
+    dance_person_min_m: float = 2.0      # dance: nobody within this range
 
     @classmethod
     def from_env(cls, env: Optional[dict] = None) -> "SafetyConfig":
@@ -105,6 +119,8 @@ class SafetyConfig:
                 setattr(cfg, name, str(raw).strip().lower() in ("1", "true", "yes", "on"))
             else:
                 setattr(cfg, name, float(raw))
+        if "SAFETY_SPRINT_VMAX" not in env and "SPRINT_VMAX" in env:
+            cfg.sprint_vmax = float(env["SPRINT_VMAX"])
         return cfg
 
 
@@ -122,6 +138,7 @@ class SafetyDecision:
     t: float = 0.0
     backoff: bool = False
     reasons: List[str] = field(default_factory=list)
+    sprint: bool = False                  # vmax raised to sprint_vmax
 
     def to_dict(self) -> dict:
         d = asdict(self)
@@ -192,7 +209,11 @@ def time_to_collision(px: float, py: float, rvx: float, rvy: float,
 
 
 def is_vulnerable(p: Any, cfg: SafetyConfig) -> bool:
-    """Child (short) or fast-moving person -> zones x vulnerable_factor."""
+    """Child (short) or fast-moving person -> zones x vulnerable_factor.
+    Fleet robot tracks (kind == "robot") never are: their bubble is built in
+    by fleet_tracks()."""
+    if _get(p, "kind") == "robot":
+        return False
     vx, vy = _num(_get(p, "vx", 0.0)) or 0.0, _num(_get(p, "vy", 0.0)) or 0.0
     if math.hypot(vx, vy) > cfg.fast_speed_mps:
         return True
@@ -247,7 +268,8 @@ def decide(persons: Optional[Iterable[Any]], lidar_near_m: Optional[float], odom
            cmd: Any, now: float, persons_t: Optional[float],
            cfg: Optional[SafetyConfig] = None, rear_clear_m: Optional[float] = None,
            prev: Optional[SafetyDecision] = None,
-           min_person_dist_m: Optional[float] = None) -> SafetyDecision:
+           min_person_dist_m: Optional[float] = None,
+           sprint: bool = False) -> SafetyDecision:
     """Pure safety decision.
 
     persons      PersonTrack objects or their dicts (base frame); None = no data
@@ -263,6 +285,10 @@ def decide(persons: Optional[Iterable[Any]], lidar_near_m: Optional[float], odom
     min_person_dist_m  follow/pursuit sources: linear motion that closes in on
                  any person nearer than this is zeroed (rotation and moving
                  away stay allowed)
+    sprint       the caller-side sprint preconditions (sprint_preconditions())
+                 hold. vmax is raised from clear_vmax to sprint_vmax only if
+                 the final AND raw level are CLEAR and the corridor ahead is
+                 empty; otherwise the decision is exactly the non-sprint one.
     """
     cfg = cfg or SafetyConfig()
     vx, vy, vyaw = sanitize_cmd(cmd)
@@ -363,6 +389,21 @@ def decide(persons: Optional[Iterable[Any]], lidar_near_m: Optional[float], odom
     vyaw_max = {CLEAR: cfg.clear_vyaw_max, CAUTION: cfg.caution_vyaw_max,
                 SLOW: cfg.slow_vyaw_max, STOP: cfg.stop_vyaw_max}[level]
 
+    # -- sprint (only ever raises the CLEAR cap; every other path unchanged) ---
+    sprinting = False
+    if sprint:
+        if level == CLEAR and raw_level == CLEAR:
+            blockers = persons_in_corridor(plist, (vx, vy), cfg.sprint_corridor_half_w_m,
+                                           cfg.sprint_corridor_len_m)
+            if blockers:
+                reasons.append("sprint denied: %d person(s) in corridor" % len(blockers))
+            else:
+                vmax = max(vmax, cfg.sprint_vmax)
+                sprinting = True
+                reasons.append("sprint")
+        else:
+            reasons.append("sprint denied: level %s" % level)
+
     # -- clamp (monotonic) ----------------------------------------------------
     backoff = False
     if level == STOP:
@@ -383,6 +424,8 @@ def decide(persons: Optional[Iterable[Any]], lidar_near_m: Optional[float], odom
     md = _num(min_person_dist_m)
     if md is not None and (ovx != 0.0 or ovy != 0.0):
         for p in plist:
+            if _get(p, "kind") == "robot":             # follow rule is for people only
+                continue
             px, py = _num(_get(p, "x")), _num(_get(p, "y"))
             if px is None or py is None:
                 continue
@@ -399,7 +442,187 @@ def decide(persons: Optional[Iterable[Any]], lidar_near_m: Optional[float], odom
                           cmd_out=(ovx, ovy, ovyaw), raw_level=raw_level,
                           nearest_person_m=None if nearest is None else round(nearest, 3),
                           ttc_s=None if best_ttc is None else round(best_ttc, 3),
-                          relax_since=relax_since, t=now, backoff=backoff, reasons=reasons)
+                          relax_since=relax_since, t=now, backoff=backoff, reasons=reasons,
+                          sprint=sprinting)
+
+
+# ---------------------------------------------------------------------------
+# sprint / action / dead-man helpers (pure)
+
+def persons_in_corridor(persons: Optional[Iterable[Any]], direction: Tuple[float, float],
+                        half_w: float, length: float) -> list:
+    """Persons (base frame) inside the rectangle |lateral| <= half_w,
+    0 <= forward <= length along `direction` (the commanded linear motion;
+    zero -> robot +x). A malformed track counts as inside (fail-safe)."""
+    dx, dy = _num(direction[0]) or 0.0, _num(direction[1]) or 0.0
+    n = math.hypot(dx, dy)
+    ux, uy = (dx / n, dy / n) if n > 1e-6 else (1.0, 0.0)
+    out = []
+    for p in persons or ():
+        px, py = _num(_get(p, "x")), _num(_get(p, "y"))
+        if px is None or py is None:
+            out.append(p)
+            continue
+        fwd = px * ux + py * uy
+        lat = -px * uy + py * ux
+        if 0.0 <= fwd <= length and abs(lat) <= half_w:
+            out.append(p)
+    return out
+
+
+def battery_ok(battery_pct: Any, min_pct: float) -> Tuple[bool, str]:
+    b = _num(battery_pct)
+    if b is None or not 0.0 <= b <= 100.0:
+        return False, "battery unknown"
+    if b <= min_pct:
+        return False, "battery %.0f%% <= %.0f%%" % (b, min_pct)
+    return True, "battery %.0f%%" % b
+
+
+def sprint_preconditions(source: str, profile: Optional[str], deadman_alive: bool,
+                         battery_pct: Any, lidar_fresh: bool, persons_fresh: bool,
+                         cfg: SafetyConfig,
+                         sprint_sources: Tuple[str, ...] = ("mission",)) -> Tuple[bool, str]:
+    """Caller-side sprint gate (the level/corridor part is in decide()).
+    Returns (requested_and_allowed, reason). Not requested -> (False, "")."""
+    if profile != "sprint":
+        return False, ""
+    if source not in sprint_sources:
+        return False, "sprint denied: source %r not in %s" % (source, ",".join(sprint_sources))
+    if not deadman_alive:
+        return False, "sprint denied: dead-man not held"
+    ok, why = battery_ok(battery_pct, cfg.sprint_battery_min_pct)
+    if not ok:
+        return False, "sprint denied: " + why
+    if not lidar_fresh:
+        return False, "sprint denied: lidar not fresh"
+    if not persons_fresh:
+        return False, "sprint denied: person data not fresh"
+    return True, "sprint preconditions ok"
+
+
+JUMP_ACTIONS = ("jump", "front_jump", "pounce", "front_pounce")
+DANCE_ACTIONS = ("dance", "dance2")
+GESTURE_ACTIONS = ("hello", "wave", "greet", "stretch", "sit", "stand", "stand_up", "lay_down",
+                   "heart", "balance")
+# flips, handstand, damp, ... are deliberately NOT here: not reachable via the guard.
+ALLOWED_ACTIONS = GESTURE_ACTIONS + DANCE_ACTIONS + JUMP_ACTIONS
+
+
+def action_check(name: str, deadman_alive: bool, persons: Optional[Iterable[Any]],
+                 persons_fresh: bool, level: str, lidar_fresh: bool,
+                 front_clear_m: Optional[float], still_for_s: float,
+                 cfg: SafetyConfig) -> Tuple[bool, str]:
+    """Gate a mc_motion action. Returns (allowed, reason)."""
+    if name not in ALLOWED_ACTIONS:
+        return False, "action %r not in allowlist" % (name,)
+    if name in GESTURE_ACTIONS:
+        return True, "gesture"
+    plist = list(persons or ())
+
+    def nearest() -> Optional[float]:
+        best = None
+        for p in plist:
+            px, py = _num(_get(p, "x")), _num(_get(p, "y"))
+            if px is None or py is None:
+                return 0.0                       # malformed -> treat as touching
+            d = math.hypot(px, py)
+            best = d if best is None else min(best, d)
+        return best
+
+    if not persons_fresh:
+        return False, "person data not fresh"
+    near = nearest()
+    if name in DANCE_ACTIONS:
+        if near is not None and near < cfg.dance_person_min_m:
+            return False, "person %.2fm < %.1fm" % (near, cfg.dance_person_min_m)
+        return True, "dance clear"
+    # jump / pounce
+    if not deadman_alive:
+        return False, "dead-man not held"
+    if near is not None and near < cfg.action_person_min_m:
+        return False, "person %.2fm < %.1fm" % (near, cfg.action_person_min_m)
+    if level != CLEAR:
+        return False, "level %s" % level
+    if not lidar_fresh:
+        return False, "lidar not fresh"
+    fc = _num(front_clear_m)
+    if fc is None or fc < cfg.action_front_clear_m:
+        return False, "front clearance %s < %.1fm" % ("?" if fc is None else "%.2fm" % fc,
+                                                      cfg.action_front_clear_m)
+    if still_for_s < cfg.action_still_s:
+        return False, "robot not still (%.2fs < %.1fs)" % (max(still_for_s, 0.0), cfg.action_still_s)
+    return True, "jump clear"
+
+
+def fleet_tracks(robots: Any, own_id: str, own_pose: Any, bubble_m: float = 1.5,
+                 stop_m: float = 0.8, max_range_m: float = 10.0) -> list:
+    """Other fleet robots (world frame, mc.fleet.robots) -> person-like base
+    frame tracks with kind="robot". Each one is moved radially closer by
+    (bubble_m - stop_m), so decide()'s person STOP zone (stop_m) fires at
+    bubble_m true distance and SLOW/CAUTION/TTC scale with it. own_pose =
+    (x, y, yaw) world; None -> no tracks. Malformed entries are skipped (the
+    fleet feed is optional; LiDAR still sees the robot)."""
+    if own_pose is None or not isinstance(robots, (list, tuple)):
+        return []
+    ox, oy, oyaw = (_num(v) for v in own_pose[:3])
+    if ox is None or oy is None or oyaw is None:
+        return []
+    c, s = math.cos(oyaw), math.sin(oyaw)
+    shift = max(bubble_m - stop_m, 0.0)
+    out = []
+    for r in robots:
+        rid = str(_get(r, "id", ""))
+        if not rid or rid == own_id:
+            continue
+        x, y = _num(_get(r, "x")), _num(_get(r, "y"))
+        if x is None or y is None:
+            continue
+        rvx, rvy = _num(_get(r, "vx", 0.0)) or 0.0, _num(_get(r, "vy", 0.0)) or 0.0
+        dx, dy = x - ox, y - oy
+        bx, by = c * dx + s * dy, -s * dx + c * dy
+        d = math.hypot(bx, by)
+        if d > max_range_m:
+            continue
+        k = max(d - shift, 0.0) / d if d > 1e-6 else 0.0
+        out.append({"gid": "robot:" + rid, "kind": "robot", "x": bx * k, "y": by * k, "z": 0.0,
+                    "height_m": 0.0, "vx": c * rvx + s * rvy, "vy": -s * rvx + c * rvy,
+                    "true_dist_m": round(d, 3)})
+    return out
+
+
+class DeadmanRegistry:
+    """Heartbeats per client_id. Alive if any client beat within timeout_s.
+    Pure: every call takes `now`. Bounded (max_clients) against abuse."""
+
+    def __init__(self, timeout_s: float = 0.3, max_clients: int = 32) -> None:
+        self.timeout_s = timeout_s
+        self.max_clients = max_clients
+        self.beats: dict = {}
+
+    def beat(self, client_id: Any, now: float) -> bool:
+        cid = str(client_id or "").strip()[:64]
+        if not cid:
+            return False
+        if cid not in self.beats and len(self.beats) >= self.max_clients:
+            self.prune(now)
+            if len(self.beats) >= self.max_clients:
+                return False
+        self.beats[cid] = now
+        return True
+
+    def release(self, client_id: Any) -> None:
+        self.beats.pop(str(client_id or "").strip()[:64], None)
+
+    def prune(self, now: float, keep_s: float = 10.0) -> None:
+        for cid in [c for c, t in self.beats.items() if now - t > keep_s or t > now + 1.0]:
+            del self.beats[cid]
+
+    def clients(self, now: float) -> List[str]:
+        return sorted(c for c, t in self.beats.items() if 0.0 <= now - t < self.timeout_s)
+
+    def alive(self, now: float) -> bool:
+        return bool(self.clients(now))
 
 
 # ---------------------------------------------------------------------------

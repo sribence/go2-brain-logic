@@ -28,6 +28,7 @@ sys.path.insert(0, os.path.join(HERE, "..", "core"))
 
 from fastapi import FastAPI, HTTPException  # noqa: E402
 from fastapi.middleware.cors import CORSMiddleware  # noqa: E402
+from fastapi.responses import JSONResponse  # noqa: E402
 from pydantic import BaseModel  # noqa: E402
 
 
@@ -50,6 +51,9 @@ _core = _load_core()
 STOP, SafetyConfig, SafetyDecision, decide = _core.STOP, _core.SafetyConfig, _core.SafetyDecision, _core.decide
 lidar_near_in_direction, rear_clearance, sanitize_cmd = (_core.lidar_near_in_direction, _core.rear_clearance,
                                                          _core.sanitize_cmd)
+CLEAR, DeadmanRegistry, sprint_preconditions, action_check = (_core.CLEAR, _core.DeadmanRegistry,
+                                                              _core.sprint_preconditions, _core.action_check)
+JUMP_ACTIONS, ALLOWED_ACTIONS = _core.JUMP_ACTIONS, _core.ALLOWED_ACTIONS
 
 try:
     import redis  # type: ignore
@@ -82,6 +86,24 @@ FOLLOW_SOURCES = tuple(s.strip() for s in os.environ.get(
     "SAFETY_FOLLOW_SOURCES", "pursuit,follow,follow_executor").split(",") if s.strip())
 CALLER_TIMEOUT_S = float(os.environ.get("SAFETY_CALLER_TIMEOUT_S", "0.3"))
 HTTP_TIMEOUT_S = float(os.environ.get("SAFETY_HTTP_TIMEOUT_S", "0.25"))
+# mission/CONTRACT.md section 4: dead-man, battery (sprint gate), actions
+DEADMAN_TIMEOUT_S = float(os.environ.get("DEADMAN_TIMEOUT_S", "0.3"))
+CORE_URL = os.environ.get("CORE_URL", "http://127.0.0.1:9101").rstrip("/")
+BATTERY_MAX_AGE_S = float(os.environ.get("SAFETY_BATTERY_MAX_AGE_S", "5.0"))
+MOTION_WATCHDOG_S = float(os.environ.get("SAFETY_MOTION_WATCHDOG_S", "0.5"))  # mc_motion COMMAND_TIMEOUT_S
+# mission/CONTRACT.md 4 + 9.4: sprint only from these sources (gamepad = robot-side BT
+# bridge / browser pad, which holds the dead-man with client_id "gamepad")
+SPRINT_SOURCES = tuple(s.strip() for s in os.environ.get(
+    "SAFETY_SPRINT_SOURCES", "mission,gamepad").split(",") if s.strip())
+# 9.6: other fleet robots as person-like tracks with a 1.5 m bubble
+FLEET_AWARE = os.environ.get("SAFETY_FLEET_AWARE", "1") == "1"
+FLEET_CHANNEL = "mc.fleet.robots"
+ROBOT_ID = os.environ.get("ROBOT_ID", "go2")
+FLEET_BUBBLE_M = float(os.environ.get("SAFETY_FLEET_BUBBLE_M", "1.5"))
+FLEET_MAX_AGE_S = float(os.environ.get("SAFETY_FLEET_MAX_AGE_S", "1.0"))
+POSE_MAX_AGE_S = float(os.environ.get("SAFETY_POSE_MAX_AGE_S", "0.5"))
+CORE_POLL_HZ = float(os.environ.get("SAFETY_CORE_POLL_HZ", "10"))
+fleet_tracks = _core.fleet_tracks
 
 LOG_DIR = os.path.join(HERE, "logs")
 LOG_PATH = os.path.join(LOG_DIR, "events.jsonl")
@@ -261,6 +283,94 @@ class Guard:
         self.stops = 0
         self.escalations = 0
         self.events: list = []
+        # dead-man / sprint / actions (mission/CONTRACT.md section 4)
+        self.deadman = DeadmanRegistry(DEADMAN_TIMEOUT_S)
+        self.battery_pct: Optional[float] = None
+        self.battery_t: Optional[float] = None
+        self.last_profile: Optional[str] = None
+        self.sprint_active = False             # last forwarded /move was a sprint
+        self.sprint_latch = False              # dead-man dropped mid-sprint: sprint-profile moves -> /stop
+        self.last_motion_t = 0.0               # last time a non-zero command was forwarded
+        self.sprint_reason = ""
+        self.deadman_drops = 0
+        self.actions: list = []
+        self.fleet_robots: Optional[list] = None
+        self.fleet_t: Optional[float] = None
+        self.own_pose: Optional[Tuple[float, float, float]] = None   # world (core /state)
+        self.own_pose_t: Optional[float] = None
+
+    # -- fleet (9.6) ------------------------------------------------------------
+    def ingest_fleet(self, msg: Any, recv_t: Optional[float] = None) -> None:
+        recv_t = time.time() if recv_t is None else recv_t
+        if not isinstance(msg, dict) or not isinstance(msg.get("robots"), list):
+            return
+        try:
+            t = float(msg.get("t", recv_t))
+        except (TypeError, ValueError):
+            t = recv_t
+        with self.lock:
+            self.fleet_robots = [r for r in msg["robots"] if isinstance(r, dict)]
+            self.fleet_t = min(t, recv_t) if math.isfinite(t) else recv_t
+
+    def set_pose(self, x: float, y: float, yaw: float, t: Optional[float] = None) -> None:
+        with self.lock:
+            self.own_pose = (x, y, yaw)
+            self.own_pose_t = time.time() if t is None else t
+
+    def _fleet(self, now: float) -> list:
+        """Fresh other-robot tracks (base frame), [] when off / no data."""
+        if not FLEET_AWARE or self.fleet_robots is None or self.fleet_t is None or self.own_pose_t is None:
+            return []
+        if now - self.fleet_t > FLEET_MAX_AGE_S or now - self.own_pose_t > POSE_MAX_AGE_S:
+            return []
+        return fleet_tracks(self.fleet_robots, ROBOT_ID, self.own_pose, FLEET_BUBBLE_M, self.cfg.stop_m,
+                            max(10.0, self.cfg.sprint_corridor_len_m + 2.0))
+
+    def _persons(self, now: float) -> Tuple[Optional[list], Optional[float]]:
+        """Person tracks + fleet robots. No person data stays None (SLOW)."""
+        persons, pt = self.persons.get()
+        if persons is None:
+            return None, pt
+        robots = self._fleet(now)
+        return (list(persons) + robots if robots else persons), pt
+
+    # -- dead-man / battery ----------------------------------------------------
+    def deadman_beat(self, client_id: Any, now: Optional[float] = None) -> bool:
+        now = time.time() if now is None else now
+        with self.lock:
+            ok = self.deadman.beat(client_id, now)
+            if ok and self.sprint_latch:
+                self.sprint_latch = False
+                self._note("dead-man held again by %s: sprint latch cleared" % client_id)
+            return ok
+
+    def deadman_alive(self, now: Optional[float] = None) -> bool:
+        with self.lock:
+            return self.deadman.alive(time.time() if now is None else now)
+
+    def set_battery(self, pct: Optional[float], t: Optional[float] = None) -> None:
+        with self.lock:
+            self.battery_pct = pct
+            self.battery_t = time.time() if t is None else t
+
+    def _battery(self, now: float) -> Optional[float]:
+        if self.battery_pct is None or self.battery_t is None or now - self.battery_t > BATTERY_MAX_AGE_S:
+            return None
+        return self.battery_pct
+
+    def _persons_fresh(self, now: float) -> bool:
+        persons, pt = self.persons.get()
+        return persons is not None and pt is not None and now - pt <= self.cfg.persons_stale_s
+
+    def _still_for(self, now: float) -> float:
+        """Seconds since the last non-zero command could still be driving the
+        robot (a non-zero last_cmd_out keeps it moving until mc_motion's
+        watchdog fires MOTION_WATCHDOG_S after the last caller tick)."""
+        if any(abs(v) > self.cfg.action_still_eps for v in self.last_cmd_out):
+            if not self.last_caller_t:
+                return now - self.last_motion_t - MOTION_WATCHDOG_S
+            return now - max(self.last_motion_t, self.last_caller_t) - MOTION_WATCHDOG_S
+        return now - self.last_motion_t
 
     # -- inputs --------------------------------------------------------------
     def set_lidar(self, points: Optional[list], t: Optional[float] = None) -> None:
@@ -277,16 +387,22 @@ class Guard:
 
     # -- decision ------------------------------------------------------------
     def evaluate(self, cmd: Tuple[float, float, float], now: Optional[float] = None,
-                 source: str = "") -> SafetyDecision:
+                 source: str = "", profile: Optional[str] = None) -> SafetyDecision:
         now = time.time() if now is None else now
         min_d = self.cfg.follow_min_m if source in FOLLOW_SOURCES else None
         with self.lock:
             pts = self._lidar(now)
             near = lidar_near_in_direction(pts, cmd, LIDAR_CONE_RAD, LIDAR_Z_MIN, LIDAR_Z_MAX)
             rear = rear_clearance(pts, LIDAR_CONE_RAD, LIDAR_Z_MIN, LIDAR_Z_MAX)
-            persons, pt = self.persons.get()
+            persons, pt = self._persons(now)
+            sprint_ok, self.sprint_reason = sprint_preconditions(
+                source, profile, self.deadman.alive(now), self._battery(now), pts is not None,
+                self._persons_fresh(now), self.cfg, SPRINT_SOURCES)
             dec = decide(persons, near, self.odom, cmd, now, pt, self.cfg,
-                         rear_clear_m=rear, prev=self.prev, min_person_dist_m=min_d)
+                         rear_clear_m=rear, prev=self.prev, min_person_dist_m=min_d,
+                         sprint=sprint_ok)
+            if profile == "sprint" and not sprint_ok and self.sprint_reason:
+                dec.reasons.append(self.sprint_reason)
             if self.prev is None or dec.level != self.prev.level:
                 self._note("level %s -> %s (%s)" % (self.prev.level if self.prev else "-",
                                                     dec.level, dec.reason))
@@ -300,26 +416,62 @@ class Guard:
         del self.events[:-50]
         log_event("info", msg)
 
-    def _send(self, dec: SafetyDecision) -> Tuple[str, int, dict]:
-        """Forward a decision: STOP with nothing left -> /stop, else /move."""
+    def _send(self, dec: SafetyDecision, now: Optional[float] = None) -> Tuple[str, int, dict]:
+        """Forward a decision: STOP with nothing left -> /stop, else /move.
+        A sprint decision adds "sprint": true (mc_motion honours it only with
+        MOTION_ALLOW_SPRINT=1); every other body is exactly {vx, vy, vyaw}."""
         vx, vy, vyaw = dec.cmd_out
         if dec.level == STOP and vx == 0.0 and vy == 0.0 and vyaw == 0.0:
             code, resp = _forward("/stop", None)
             self.stops += 1
+            self.sprint_active = False
             return "stop", code, resp
-        code, resp = _forward("/move", {"vx": vx, "vy": vy, "vyaw": vyaw})
+        body = {"vx": vx, "vy": vy, "vyaw": vyaw}
+        if dec.sprint:
+            body["sprint"] = True
+        code, resp = _forward("/move", body)
         self.forwarded += 1
+        self.sprint_active = bool(dec.sprint)
+        if vx != 0.0 or vy != 0.0 or vyaw != 0.0:
+            self.last_motion_t = time.time() if now is None else now
         return "move", code, resp
 
-    def move(self, vx: Any, vy: Any, vyaw: Any, source: str = "") -> dict:
+    def _deadman_drop_stop(self, now: float, why: str) -> Tuple[int, dict]:
+        """Dead-man released while sprinting: one /stop, latch further
+        sprint-profile moves to /stop until the dead-man is held again or the
+        source drops the sprint profile."""
+        code, resp = _forward("/stop", None)
+        self.stops += 1
+        self.deadman_drops += 1
+        self.sprint_active = False
+        self.sprint_latch = True
+        self.last_cmd_out = (0.0, 0.0, 0.0)
+        self._note("dead-man dropped during sprint (%s): /stop" % why)
+        return code, resp
+
+    def move(self, vx: Any, vy: Any, vyaw: Any, source: str = "",
+             profile: Optional[str] = None) -> dict:
         cmd = sanitize_cmd((vx, vy, vyaw))
         now = time.time()
         with self.lock:
-            dec = self.evaluate(cmd, now, source)
+            dec = self.evaluate(cmd, now, source, profile)
             self.last_cmd_in = cmd
             self.last_caller_t = now
             self.last_source = source or "?"
-            kind, code, resp = self._send(dec)
+            self.last_profile = profile
+            if profile != "sprint" and self.sprint_latch:
+                self.sprint_latch = False
+                self._note("sprint latch cleared: %s sent profile %r" % (source or "?", profile))
+            if profile == "sprint" and (self.sprint_active or self.sprint_latch) and not self.deadman.alive(now):
+                if self.sprint_active:
+                    code, resp = self._deadman_drop_stop(now, "move")
+                else:                              # latched: keep stopping
+                    code, resp = _forward("/stop", None)
+                    self.stops += 1
+                self.last_cmd_out = (0.0, 0.0, 0.0)
+                return {"forwarded": "stop", "motion_status": code, "motion": resp,
+                        "decision": dict(dec.to_dict(), reason="dead-man released during sprint")}
+            kind, code, resp = self._send(dec, now)
             self.last_cmd_out = dec.cmd_out if kind == "move" else (0.0, 0.0, 0.0)
         return {"forwarded": kind, "motion_status": code, "motion": resp,
                 "decision": dec.to_dict()}
@@ -331,6 +483,7 @@ class Guard:
             self.last_cmd_in = (0.0, 0.0, 0.0)
             self.last_cmd_out = (0.0, 0.0, 0.0)
             self.last_caller_t = 0.0
+            self.sprint_active = False
         self._note("stop requested by %s" % (source or "?"))
         return {"forwarded": "stop", "motion_status": code, "motion": resp}
 
@@ -343,7 +496,15 @@ class Guard:
         with self.lock:
             live = self.last_caller_t and (now - self.last_caller_t) <= CALLER_TIMEOUT_S
             cmd = self.last_cmd_in if live else (0.0, 0.0, 0.0)
-            dec = self.evaluate(cmd, now, self.last_source if live else "")
+            dec = self.evaluate(cmd, now, self.last_source if live else "",
+                                self.last_profile if live else None)
+            if self.sprint_active and not self.deadman.alive(now):
+                # dead-man dropped while the last forwarded command was a
+                # sprint: one /stop at once (caller live or not -- the robot
+                # may still be running on it until mc_motion's watchdog).
+                self._deadman_drop_stop(now, "tick")
+                self.escalations += 1
+                return dec
             if live and any(abs(o) > 0.0 for o in self.last_cmd_out):
                 new = dec.cmd_out
                 if dec.level == STOP and new == (0.0, 0.0, 0.0):
@@ -352,7 +513,7 @@ class Guard:
                     smaller = all(abs(n) <= abs(o) + 1e-9 for n, o in zip(new, self.last_cmd_out)) and \
                         any(abs(n) < abs(o) - 1e-6 for n, o in zip(new, self.last_cmd_out))
                 if smaller:
-                    kind, _, _ = self._send(dec)
+                    kind, _, _ = self._send(dec, now)
                     self.last_cmd_out = dec.cmd_out if kind == "move" else (0.0, 0.0, 0.0)
                     self.escalations += 1
             return dec
@@ -371,14 +532,59 @@ class Guard:
                       "last_cmd_in": self.last_cmd_in, "last_cmd_out": self.last_cmd_out,
                       "forwarded": self.forwarded, "stops": self.stops,
                       "escalations": self.escalations, "events": self.events[-10:][::-1]})
+            now = time.time()
+            bat = self._battery(now)
+            d.update({"deadman_alive": self.deadman.alive(now),
+                      "deadman_clients": self.deadman.clients(now),
+                      "deadman_timeout_s": DEADMAN_TIMEOUT_S,
+                      "deadman_drops": self.deadman_drops,
+                      "battery_pct": bat,
+                      "battery_age_s": None if self.battery_t is None else round(now - self.battery_t, 3),
+                      "sprint_active": self.sprint_active, "sprint_latch": self.sprint_latch,
+                      "sprint_reason": self.sprint_reason, "sprint_vmax": self.cfg.sprint_vmax,
+                      "last_profile": self.last_profile, "sprint_sources": list(SPRINT_SOURCES),
+                      "fleet_aware": FLEET_AWARE, "fleet_robots_n": len(self._fleet(now)),
+                      "pose_age_s": None if self.own_pose_t is None else round(now - self.own_pose_t, 3),
+                      "still_for_s": round(max(self._still_for(now), 0.0), 3),
+                      "actions": self.actions[-10:][::-1]})
             return d
+
+    # -- actions ---------------------------------------------------------------
+    def action(self, name: str, source: str = "", now: Optional[float] = None) -> Tuple[int, dict]:
+        """Gate POST /action/{name}; forward to MOTION_URL/action/{name} only
+        when allowed. Returns (http_status, body); 409 on denial."""
+        now = time.time() if now is None else now
+        with self.lock:
+            pts = self._lidar(now)
+            persons, _ = self._persons(now)
+            dec = self.evaluate((0.0, 0.0, 0.0), now, "")      # level with the robot still
+            front = lidar_near_in_direction(pts, (1.0, 0.0, 0.0), LIDAR_CONE_RAD, LIDAR_Z_MIN, LIDAR_Z_MAX)
+            ok, why = action_check(name, self.deadman.alive(now), persons, self._persons_fresh(now),
+                                   dec.level, pts is not None, front, self._still_for(now), self.cfg)
+            rec = {"t": now, "name": name, "source": source or "?", "decision": "allow" if ok else "deny",
+                   "reason": why}
+            self.actions.append(rec)
+            del self.actions[:-50]
+            if not ok:
+                log_event("warn", "action %s denied: %s" % (name, why))
+                return 409, {"decision": "deny", "reason": why, "action": name, "level": dec.level}
+            code, resp = _forward("/action/%s" % name, None)
+        log_event("info", "action %s forwarded (%s)" % (name, code))
+        out = {"decision": "allow", "reason": why, "action": name, "forwarded": "action",
+               "motion_status": code, "motion": resp}
+        if code == 0:
+            return 502, out
+        if code >= 400:
+            return code, out
+        return 200, out
 
     def bus_state(self) -> dict:
         """Payload for mc.safety.state (CONTRACTS.md section D)."""
         s = self.last or {}
         return {"t": time.time(), "level": s.get("level", STOP), "vmax": s.get("vmax", 0.0),
                 "nearest_person_m": s.get("nearest_person_m"), "reason": s.get("reason", "starting"),
-                "vyaw_max": s.get("vyaw_max"), "ttc_s": s.get("ttc_s")}
+                "vyaw_max": s.get("vyaw_max"), "ttc_s": s.get("ttc_s"),
+                "deadman_alive": self.deadman_alive(), "sprint": self.sprint_active}
 
 
 guard = Guard()
@@ -462,6 +668,84 @@ def _odom_loop() -> None:
         time.sleep(0.1)
 
 
+def parse_core_battery(state: Any) -> Optional[float]:
+    """core GET /state -> battery percent, or None when unknown: missing /
+    non-finite / out of range, or the core link is tracked and unhealthy
+    (then every field is a 0-default, not a reading)."""
+    if not isinstance(state, dict):
+        return None
+    link = state.get("link")
+    if isinstance(link, dict) and link.get("tracked") and not link.get("healthy"):
+        return None
+    bat = state.get("battery")
+    if not isinstance(bat, dict):
+        return None
+    try:
+        pct = float(bat.get("percent"))
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(pct) or not 0.0 <= pct <= 100.0:
+        return None
+    return pct
+
+
+def parse_core_pose(state: Any) -> Optional[Tuple[float, float, float]]:
+    """core GET /state pose (world/grid frame) or None (no fix / bad link)."""
+    if not isinstance(state, dict):
+        return None
+    link = state.get("link")
+    if isinstance(link, dict) and link.get("tracked") and not link.get("healthy"):
+        return None
+    pose = state.get("pose")
+    if not isinstance(pose, dict):
+        return None
+    try:
+        vals = tuple(float(pose[k]) for k in ("x", "y", "yaw"))
+    except (KeyError, TypeError, ValueError):
+        return None
+    return vals if all(math.isfinite(v) for v in vals) else None
+
+
+def _core_state_loop() -> None:
+    """Battery (sprint gate) + world pose (fleet tracks) from core /state.
+    Unknown values are not stored, so the last ones age out."""
+    period = 1.0 / max(CORE_POLL_HZ, 0.5)
+    while requests is not None:
+        t0 = time.time()
+        try:
+            r = requests.get(CORE_URL + "/state", timeout=HTTP_TIMEOUT_S)
+            st = r.json() if r.ok else None
+            pct, pose = parse_core_battery(st), parse_core_pose(st)
+            if pct is not None:
+                guard.set_battery(pct, t0)
+            if pose is not None:
+                guard.set_pose(pose[0], pose[1], pose[2], t0)
+        except Exception:  # noqa: BLE001
+            pass
+        time.sleep(max(0.0, period - (time.time() - t0)))
+
+
+def _fleet_redis_loop() -> None:
+    while True:
+        r = _redis_client()
+        if r is None:
+            time.sleep(5.0)
+            continue
+        try:
+            ps = r.pubsub()
+            ps.subscribe(FLEET_CHANNEL)
+            log_event("info", "subscribed to %s" % FLEET_CHANNEL)
+            for msg in ps.listen():
+                if msg.get("type") == "message":
+                    try:
+                        guard.ingest_fleet(json.loads(msg["data"]))
+                    except (ValueError, TypeError):
+                        pass
+        except Exception as exc:  # noqa: BLE001
+            log_event("warn", "redis fleet loop: %s" % exc)
+            time.sleep(1.0)
+
+
 def _state_loop() -> None:
     period = 1.0 / max(STATE_HZ, 1.0)
     r = None
@@ -483,8 +767,11 @@ def start_background(lidar_kind: str = LIDAR_SOURCE) -> None:
     src = make_lidar_source(lidar_kind)
     guard.lidar_name = src.name
     for target, args, name in ((_persons_redis_loop, (), "persons"), (_lidar_loop, (src,), "lidar"),
-                               (_odom_loop, (), "odom"), (_state_loop, (), "state")):
+                               (_odom_loop, (), "odom"), (_state_loop, (), "state"),
+                               (_core_state_loop, (), "core")):
         threading.Thread(target=target, args=args, daemon=True, name="safety-" + name).start()
+    if FLEET_AWARE:
+        threading.Thread(target=_fleet_redis_loop, daemon=True, name="safety-fleet").start()
 
 
 # ---------------------------------------------------------------------------
@@ -499,6 +786,16 @@ class MoveBody(BaseModel):
     vy: float = 0.0
     vyaw: float = 0.0
     source: str = ""
+    profile: Optional[str] = None      # stealth|precise|normal|sprint (only "sprint" changes anything)
+
+
+class DeadmanBody(BaseModel):
+    client_id: str = ""
+    release: bool = False
+
+
+class ActionBody(BaseModel):
+    source: str = ""
 
 
 class StopBody(BaseModel):
@@ -507,7 +804,7 @@ class StopBody(BaseModel):
 
 @app.post("/move")
 def move(body: MoveBody):
-    res = guard.move(body.vx, body.vy, body.vyaw, body.source)
+    res = guard.move(body.vx, body.vy, body.vyaw, body.source, body.profile)
     code = res["motion_status"]
     if code == 0:
         raise HTTPException(status_code=502, detail=res)
@@ -529,6 +826,26 @@ def estop():
     code, resp = _forward("/estop", None)
     guard._note("estop forwarded (%s)" % code)
     return {"forwarded": "estop", "motion_status": code, "motion": resp}
+
+
+@app.post("/deadman")
+def deadman(body: DeadmanBody):
+    """Heartbeat (>= 5 Hz, UI sends 10 Hz). release=true drops this client at once."""
+    if body.release:
+        with guard.lock:
+            guard.deadman.release(body.client_id)
+    elif not guard.deadman_beat(body.client_id):
+        raise HTTPException(status_code=422, detail="client_id required (or too many clients)")
+    now = time.time()
+    with guard.lock:
+        return {"deadman_alive": guard.deadman.alive(now), "deadman_clients": guard.deadman.clients(now),
+                "timeout_s": DEADMAN_TIMEOUT_S}
+
+
+@app.post("/action/{name}")
+def action(name: str, body: Optional[ActionBody] = None):
+    code, res = guard.action(name, body.source if body else "")
+    return JSONResponse(status_code=code, content=res)
 
 
 @app.get("/state")
