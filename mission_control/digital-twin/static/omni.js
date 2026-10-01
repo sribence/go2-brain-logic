@@ -226,6 +226,8 @@ async function main() {
     stopDemo();
     state.source = "live";
     setRig(F.normalizeRig(rigJSON));
+    if (rigJSON && Number.isFinite(+rigJSON.ground_z) && Math.abs(-rigJSON.ground_z - F.BASE_HEIGHT) > 0.03)
+      console.warn(`[omni] rig.ground_z=${rigJSON.ground_z} differs from BASE_HEIGHT=${F.BASE_HEIGHT}`);
     cloud.clear();
     const decoding = new Set();
     let voxFirst = true;
@@ -255,9 +257,9 @@ async function main() {
         onMessage: (ab) => { if (ab instanceof ArrayBuffer) { cloud.ingest(ab, voxFirst); voxFirst = false; } },
       }),
       health: new Poller(async () => {
-        const r = await fetchJSON(`${EP.omniHttp}/health`, 1500);
+        const [r, st] = await Promise.all([fetchJSON(`${EP.omniHttp}/health`, 1500), fetchJSON(`${EP.omniHttp}/stats`, 1500)]);
         state.links.omni = r.ok ? "live" : "down";
-        if (r.ok) state.health = r.data;
+        if (r.ok) state.health = { ...(r.data || {}), _stats: st.ok ? st.data : null };
         return r.ok;
       }, 2000),
     };
@@ -446,9 +448,17 @@ async function main() {
     const g = h.gpu && typeof h.gpu === "object" ? h.gpu : {};
     const gpu = h.gpu_util ?? h.gpu_percent ?? g.util ?? g.load ?? g.percent ?? null;
     const temp = h.gpu_temp ?? g.temp ?? g.temp_c ?? h.temp_c ?? null;
-    let cams = h.cams || h.cameras || (h.capture && (h.capture.cams || h.capture)) || {};
+    // omni /stats: {cameras:{id:{available,fps,age_s,...}}}; /health: {cams_down:[...]}
+    let cams = (h._stats && h._stats.cameras) || h.cams || h.cameras || (h.capture && (h.capture.cams || h.capture)) || {};
     if (Array.isArray(cams)) cams = Object.fromEntries(cams.map((c) => [c.id || c.cam_id, c]));
-    return { gpu, temp, cams };
+    const down = new Set(Array.isArray(h.cams_down) ? h.cams_down : []);
+    const out = {};
+    for (const [id, c] of Object.entries(cams)) {
+      const ok = !down.has(id) && c.available !== false && c.ok !== false && !(c.age_s > 3);
+      out[id] = { ...c, ok };
+    }
+    for (const id of down) if (!out[id]) out[id] = { fps: 0, ok: false };
+    return { gpu, temp, cams: out, voxels: h._stats && h._stats.voxels };
   }
 
   function loop() {

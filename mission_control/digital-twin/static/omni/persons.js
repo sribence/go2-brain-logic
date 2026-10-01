@@ -118,6 +118,8 @@ export class PersonLayer {
       b2t(v.x, v.y, 0, it.vel);
       if (!it.pos) it.pos = it.target.clone();
       it.seen = nowS; it.data = p; it.range = range;
+      const hm = +p.height_m;
+      it.cap.scale.y = hm > 0.3 && hm < 2.5 ? hm / 1.72 : 1;   // capsule geometry is 1.72 m tall
       it.zone = zoneOf(range);
       list.push({ gid, bx: +p.x, by: +p.y, wx: w.x, wy: w.y, range, zone: it.zone, conf: +p.conf || 0, modality: p.modality || [], cams: p.cams || [], range_src: p.range_src || "?" });
     }
@@ -173,7 +175,7 @@ export class PersonLayer {
       it.path.material.color.setHex(col);
       it.path.visible = sp > 0.08;
       // label
-      tmp.copy(it.pos); tmp.y += 1.95;
+      tmp.copy(it.pos); tmp.y += 1.72 * it.cap.scale.y + 0.23;
       tmp.project(camera);
       const lab = it.label;
       if (tmp.z > 1 || tmp.z < -1 || Math.abs(tmp.x) > 1.2 || Math.abs(tmp.y) > 1.2) { lab.style.display = "none"; }

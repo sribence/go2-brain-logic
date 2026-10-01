@@ -399,3 +399,15 @@ def test_ego_delta():
 
     dx, dy, dyaw = ego_delta((1.0, 1.0, np.pi / 2), (1.0, 2.0, np.pi / 2 + 0.1))
     assert dx == pytest.approx(1.0) and dy == pytest.approx(0.0, abs=1e-9) and dyaw == pytest.approx(0.1)
+
+
+def test_map_point_mask_drops_body_and_person_points():
+    import numpy as np
+    from omni.app import map_point_mask
+    pts = np.array([[0.0, 0.0, 0.0],    # robot body
+                    [3.0, 0.0, 0.0],    # static wall
+                    [2.0, 2.0, 0.5],    # on a person
+                    [2.0, 2.9, 0.5]], np.float32)  # 0.9 m from the person
+    keep = map_point_mask(pts, np.array([[2.0, 2.0]], np.float32), person_r=0.6)
+    assert keep.tolist() == [False, True, False, True]
+    assert map_point_mask(pts).tolist() == [False, True, True, True]

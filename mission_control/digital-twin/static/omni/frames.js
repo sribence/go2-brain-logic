@@ -8,7 +8,7 @@
 // Any THREE.Group with rotation.x = -PI/2 performs exactly that mapping, so
 // geometry built in ROS coords can be dropped into a "ROS group" unchanged.
 
-export const BASE_HEIGHT = 0.33;   // body (base_link) above floor, m (Go2 standing)
+export const BASE_HEIGHT = 0.32;   // body (base_link) above floor, m == -rig.ground_z (omni /rig)
 export const ZONES = { STOP: 0.8, SLOW: 2.0, CAUTION: 3.5 };
 
 export function b2t(x, y, z, out) {
@@ -78,7 +78,11 @@ export function normalizeRig(rig) {
   const src = rig && (rig.cameras || rig);
   if (Array.isArray(src)) list = src.map((c, i) => ({ ...c, id: c.id || c.cam_id || `cam${i}` }));
   else if (src && typeof src === "object") list = Object.keys(src).map((k) => ({ ...src[k], id: src[k].id || src[k].cam_id || k }));
-  list.forEach((c, i) => { c._ord = c.order != null ? +c.order : c.index != null ? +c.index : c.idx != null ? +c.idx : i; });
+  const order = rig && Array.isArray(rig.order) ? rig.order : null;   // /ws/video cam_idx == position here
+  list.forEach((c, i) => {
+    const oi = order ? order.indexOf(c.id) : -1;
+    c._ord = oi >= 0 ? oi : c.index != null ? +c.index : c.order != null ? +c.order : c.idx != null ? +c.idx : 1000 + i;
+  });
   list.sort((a, b) => a._ord - b._ord);
   return list.map((c, i) => {
     const K = c.K || [[c.width / 2, 0, c.width / 2], [0, c.width / 2, c.height / 2], [0, 0, 1]];
@@ -91,6 +95,7 @@ export function normalizeRig(rig) {
       D: (c.D || []).map(Number),
       T, Tinv: T.clone().invert(),
       Trows: c.T_base_cam,
+      maxTheta: +c.max_fov_deg > 0 ? Math.min(+c.max_fov_deg / 2, 110) * Math.PI / 180 : undefined,
     };
   });
 }

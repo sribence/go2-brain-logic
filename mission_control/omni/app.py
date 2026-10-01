@@ -55,6 +55,11 @@ RECTIFY = os.environ.get("OMNI_RECTIFY", "1").lower() in ("1", "true", "yes")
 VOXEL_RES = float(os.environ.get("OMNI_VOXEL_RES", "0.05"))
 VOXEL_EVERY = max(1, int(os.environ.get("OMNI_VOXEL_EVERY", "2")))
 FRAME_MAX_AGE_S = float(os.environ.get("OMNI_FRAME_MAX_AGE_S", "1.0"))
+# Static-map filtering: tracked people are dynamic (they would leave trails),
+# and the robot's own body/legs must never enter the map.
+MAP_EXCLUDE_PERSONS = os.environ.get("OMNI_MAP_EXCLUDE_PERSONS", "1").lower() in ("1", "true", "yes")
+PERSON_CLEAR_R = float(os.environ.get("OMNI_PERSON_CLEAR_R", "0.6"))
+BODY_BOX = tuple(float(v) for v in os.environ.get("OMNI_BODY_BOX", "-0.45,0.45,-0.25,0.25").split(","))
 LOGS_DIR = os.environ.get("OMNI_LOG_DIR", os.path.join(HERE, "logs"))
 LOG_PATH = os.path.join(LOGS_DIR, "events.jsonl")
 try:
@@ -75,6 +80,23 @@ def log_event(level: str, msg: str, **extra) -> None:
     except OSError:
         pass
 
+
+
+def map_point_mask(pts: np.ndarray, persons_xy: Optional[np.ndarray] = None,
+                   person_r: float = 0.6, body_box=(-0.45, 0.45, -0.25, 0.25)) -> np.ndarray:
+    """True for base-frame points that belong in the static map.
+
+    Drops points inside the robot body footprint (x_min, x_max, y_min, y_max)
+    and, if persons_xy is given, points within person_r of a tracked person.
+    """
+    pts = np.asarray(pts)
+    x, y = pts[:, 0], pts[:, 1]
+    x0, x1, y0, y1 = body_box
+    keep = ~((x > x0) & (x < x1) & (y > y0) & (y < y1))
+    if persons_xy is not None and len(persons_xy):
+        d2 = ((pts[:, None, :2] - np.asarray(persons_xy, np.float32)[None, :, :2]) ** 2).sum(-1)
+        keep &= d2.min(1) >= person_r ** 2
+    return keep
 
 class _Bus(object):
     """Optional Redis publisher; never raises."""
@@ -338,13 +360,16 @@ class OmniService(object):
                 and len(lidar) and self.tick % VOXEL_EVERY == 0):
             t0 = time.time()
             try:
-                pts, rgb, temp = self._colorize(lidar, frames, self.rig)
+                pp = (np.array([[p.get("x", 0.0), p.get("y", 0.0)] for p in pd], np.float32)
+                      if pd else None)
+                static = lidar[map_point_mask(lidar, pp if MAP_EXCLUDE_PERSONS else None,
+                                              PERSON_CLEAR_R, BODY_BOX)]
+                pts, rgb, temp = self._colorize(static, frames, self.rig)
                 if len(pts):
                     near = None
-                    if pd:
-                        pp = np.array([[p.get("x", 0.0), p.get("y", 0.0)] for p in pd], np.float32)
+                    if pp is not None:
                         d2 = ((pts[:, None, :2] - pp[None, :, :]) ** 2).sum(-1)
-                        near = d2.min(1) < 0.6 ** 2
+                        near = d2.min(1) < (PERSON_CLEAR_R + 0.4) ** 2
                     world = base_to_world(np.asarray(pts, np.float32), pose)
                     with self.vm_lock:
                         self.voxels.integrate(world, rgb, temp, t=t, near_person_mask=near,
