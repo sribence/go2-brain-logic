@@ -92,5 +92,47 @@ Lépések (`op`):
 | M4 UI | `digital-twin/static/omni/mission*.js`, `digital-twin/static/omni/gamepad.js`, `omni.js`, `omni.html`, `digital-twin/server.py` (új route-ok), `tests/test_digital_twin_omni*.py` |
 | M5 world | `mission/world.py`, `mission/rules.py`, `mission/scheduler.py`, `mission/data/`, `tests/test_mission_world.py`, `tests/test_mission_rules.py` |
 | M6 NL+gesture | `mission/nl.py`, `omni/gesture.py`, `tests/test_mission_nl.py`, `tests/test_omni_gesture.py` |
+| M7 mobil UI | `digital-twin/static/omni_mobile.html`, `digital-twin/static/omni/mobile/*`, `digital-twin/static/manifest.webmanifest`, `digital-twin/static/sw.js`, `server.py`: `/m` route |
+| R1 recorder | `omni/recorder.py`, `omni/capture.py` (MJPEG passthrough + felbontás-váltás, A agent API-ját megtartva), `omni/app.py` (csak /record és /incidents route-ok + hook), `tests/test_omni_recorder.py` |
+| G1 gamepad | `go2-hardware-bridge/gamepad_bridge/*` |
+| F1 flotta | `fleet/*`, `digital-twin/static/fleet.html`, `digital-twin/static/fleet/*`, `server.py`: `/fleet` route, `tests/test_fleet*.py` |
 Koordinátor: `docker-compose.yml`, `CONVENTIONS.md`, ez a fájl, commit/push. **Senki nem commitol.**
 Közös: Python 3.8 szintaxis (`from __future__ import annotations`), numpy/fastapi/requests, tesztek hálózat/redis/hardver nélkül, a teljes `python3 -m pytest tests -q` zöld marad.
+
+## 9. Kiegészítések (2026-10-01, 2. kör — kötelező)
+
+### 9.1 Zóna-érték (ipari robot `fine` / `zXX` mintára)
+Minden mozgó lépés (`goto`, `follow_path` pontjai, `patrol`, `goto_label`, `return_home`) kap egy `zone` mezőt:
+- `"fine"` = pontos megállás: pozíció ≤ 0.05 m, yaw ≤ 3°, a robot **megáll és beáll** (lassú végső közelítés, `precise` profil az utolsó 0.5 m-en). Fotó, mérés, ajtó előtt.
+- `"z10"`, `"z30"`, `"z60"`, `"z100"` = átrepülés: a waypointot ennyi cm-en belül „elérettnek” tekinti, nem lassít le, a pályát a zónán belül lekerekíti (blend). Default: `"z30"`; a misszió utolsó pontja default `"fine"`.
+- Tervező (M2): `smooth_path(..., zones=[...])` a sarkokat a zóna sugarán belül kerekíti; `speed_profile` a `fine` pontoknál nullára lassít.
+- Executor (M1): a `fine` pontnál megáll, megvárja a stabilizálódást (0.5 s), és csak utána lép tovább.
+
+### 9.2 Új lépések
+| op | mezők | jelentés |
+|---|---|---|
+| `capture` | `x?, y?, yaw?, cams:["rgb_front",...]\|"all", mode:"max"\|"normal", label?` | (ha van póz: `goto` `zone:"fine"`-nal) → max felbontású fotó a megadott kamerákból + hőkép → `recorder` (9.3); a misszió eredményébe a fájl-URL-ek |
+| `request_passage` | `text`, `repeat_s=30`, `zone_polygon?` vagy `ahead_m=1.5`, `clear_for_s=2.0`, `timeout_s=600`, `on_timeout:"alert"\|"return"\|"abort"` | megáll, `say(text)` ismételve; vár, amíg az előtte lévő folyosó (vagy az ajtó-poligon) a LiDAR szerint **szabad** `clear_for_s` ideig (= kinyitották az ajtót), VAGY az operátor `POST /missions/{id}/continue`-t küld, VAGY gesztus `wave`; utána megy tovább. Közben `mc.mission.alert` „várakozik: …” |
+| `wait_for` | `event: "path_clear"\|"operator"\|"gesture"\|"person_gone"`, `timeout_s` | általános várakozás |
+| `record` | `on:true/false`, `mode:"evidence"` | a bizonyíték-rögzítés kézi ki/be kapcsolása |
+`POST /missions/{id}/continue` — új végpont (operátor „továbbmehetsz”).
+
+### 9.3 Bizonyíték-rögzítő (`omni/recorder.py`, R1)
+- Normál működés: **nincs tartós tárolás**, csak RAM-gyűrű: kameránként az utolsó `PREBUFFER_S=10` s **nyers MJPEG-bájtjai** (újrakódolás nélkül, olcsó) + hőképek + person-trackek.
+- Trigger: `watch`-zóna szabály, gyanús ember (éjjel, hőkamera), operátor gomb, `record` lépés → **EVIDENCE mód**: a pre-buffer mentése + a kamerák átkapcsolása max felbontásra (UVC-nél pl. 1920×1080 vagy amit a kamera tud, MJPEG passthrough) + `best_shot`: emberenként a legélesebb, legnagyobb kivágás (Laplace-élesség × bbox-méret) teljes felbontásban, + hő-kivágás. `post_s=30` s az utolsó észlelés után, aztán vissza normálra.
+- Incidens-mappa: `incidents/<ts>_<robot>/` → `frames/<cam>/<ts>.jpg`, `best/<gid>_<cam>.jpg`, `thermal/*.npy+png`, `meta.jsonl` (póz, trackek, gps?), `manifest.json` SHA-256 hash-lánccal (bizonyítási integritás). Tárhely-kvóta + rotáció (`MAX_INCIDENT_GB`).
+- API (omni :9114): `POST /record/start {reason}`, `POST /record/stop`, `GET /record/status`, `GET /incidents`, `GET /incidents/{id}` (+ fájlok). Redis `mc.omni.record` `{state, incident_id, reason}`. A `blackbox` pillér `mc.core.anomaly`-ként is kapja.
+
+### 9.4 Gamepad
+- **Böngésző** (M4/M7): Gamepad API — a telefonhoz/laptophoz párosított bármilyen BT-pad (Xbox, PS4/5, 8BitDo, generic), `standard` mapping + kézi újratérképezés.
+- **Robot-oldali** (G1, `go2-hardware-bridge/gamepad_bridge/`): a Jetsonhoz közvetlenül párosított BT-pad (evdev), telefon nélkül is. A bal kar → `safety_guard /move` `source:"gamepad"` (normál plafon), RB = dead-man (`/deadman`), B = stop, Y = stand/sit, A = akció, Start = misszió pause/resume. Ha a pad kapcsolata megszakad → `/stop`. Profilok: Xbox, DualShock/DualSense, 8BitDo, generic (konfig YAML-ban).
+
+### 9.5 Mobil UI (M7)
+Külön, érintés-first oldal: `digital-twin/static/omni_mobile.html` + `static/omni/mobile/*.js`, route `GET /m`. Telefon álló és fekvő módban, PWA (manifest + service worker a statikus fájlokra), nagy gombok, egy ujjas célkijelölés, két ujjas forgatás, hosszú nyomás = kontextus-menü (ember: árnyék / figyeld; padló: menj ide / fotó itt / ajtón átkérés), alsó lap (bottom sheet) a misszió-lépésekhez, haptikus visszajelzés (`navigator.vibrate`), dead-man = nyomva tartott nagy gomb, E-STOP mindig látható. A meglévő modulokat (`net.js`, `frames.js`, `persons.js`, `pointcloud.js`, `bowl.js`) használja, könnyített renderrel (alacsony pixel ratio, kevesebb pont).
+
+### 9.6 Flotta (több robot) — `fleet` pillér (9111) bővítése (F1)
+- Robot-regiszter: `fleet/robots.yaml` + `POST /robots` (id, név, típus `go2|xavier|...`, URL-ek: core, omni, safety, mission, digital-twin; szín). Heartbeat / állapot-aggregálás (póz, akku, safety-szint, misszió-állapot, kamerák).
+- Közös világ: közös zónák/címkék (a fleet tárolja, robotonként szinkronizálja a `mission /zones /labels`-be), közös térkép-referencia (`map_frame` + robotonkénti `T_map_robot` offset, kézi illesztés).
+- Feladat-kiosztás: `POST /fleet/missions {mission, robot_id?|"auto"}` → auto = legközelebbi szabad robot (útvonal-hossz a robot tervezőjével, akku-súlyozva); `POST /fleet/alert` → a legközelebbi robot `watch`/`shadow`-ot kap.
+- Ütközés-elkerülés robotok közt: minden robot a többit „mozgó akadályként” kapja (`mc.fleet.robots` → `safety_guard` opcionálisan személyként kezeli, 1.5 m-es buborékkal).
+- UI: `GET /fleet` oldal (digital-twin route, F1 írja: `static/fleet.html` + `static/fleet/*.js`) — felülnézeti közös térkép az összes robottal, misszió-kiosztás drag&drop-pal, robotonkénti kamera-csempék, riasztás-lista, robotra kattintva megnyílik az adott robot OmniView-ja.
