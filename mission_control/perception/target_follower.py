@@ -43,11 +43,11 @@ class FollowConfig:
     k_yaw: float = 1.5                 # vyaw = k * bearing (rad)
     yaw_deadband_deg: float = 6.0
     turn_first_deg: float = 45.0       # vx scaled to 0 at this bearing: turn before driving
-    max_vx: float = 0.5                # m/s  (Go2 can do much more -- start slow)
+    max_vx: float = 1.2                # m/s  (Go2 can do much more -- start slow)
     max_reverse_vx: float = 0.2        # m/s  back away slowly when the person comes too close
     reverse_max_bearing_deg: float = 30.0  # back away only if the person is roughly in front
-    max_vyaw: float = 0.8              # rad/s
-    max_accel: float = 0.5             # m/s^2, ramp-up limit (stopping is immediate)
+    max_vyaw: float = 1.6              # rad/s
+    max_accel: float = 1.0             # m/s^2, ramp-up limit (stopping is immediate)
     max_yaw_accel: float = 3.0         # rad/s^2
     latency_comp: bool = True          # predict bearing over (now - capture time)
     command_ttl_s: float = 0.5         # executor must drop a command older than this

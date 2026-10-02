@@ -44,9 +44,12 @@ RATE_HZ = float(os.environ.get("RATE_HZ", "20"))
 MAX_RESULT_AGE_S = float(os.environ.get("MAX_RESULT_AGE_S", "0.4"))
 # Hard caps. POST /limits can lower the working limits at runtime, never raise
 # them above these.
-EXEC_MAX_VX = float(os.environ.get("EXEC_MAX_VX", "0.4"))            # forward, m/s
+EXEC_MAX_VX = float(os.environ.get("EXEC_MAX_VX", "1.2"))            # forward hard cap, m/s
 EXEC_MAX_VX_BACK = float(os.environ.get("EXEC_MAX_VX_BACK", "0.2"))  # backward, m/s
-EXEC_MAX_VYAW = float(os.environ.get("EXEC_MAX_VYAW", "0.8"))        # rad/s
+EXEC_MAX_VYAW = float(os.environ.get("EXEC_MAX_VYAW", "1.6"))        # rad/s hard cap
+# The working limits start low (the console slider raises them up to the caps).
+EXEC_START_VX = min(EXEC_MAX_VX, float(os.environ.get("EXEC_START_VX", "0.4")))
+EXEC_START_VYAW = min(EXEC_MAX_VYAW, float(os.environ.get("EXEC_START_VYAW", "0.8")))
 HTTP_TIMEOUT_S = 0.25
 
 
@@ -125,7 +128,7 @@ class Executor:
         self.overrides_seen: Optional[int] = None
         self._odom_prev: Optional[tuple] = None
         self.events: list = []
-        self.limits = {"max_vx": EXEC_MAX_VX, "max_vx_back": EXEC_MAX_VX_BACK, "max_vyaw": EXEC_MAX_VYAW}
+        self.limits = {"max_vx": EXEC_START_VX, "max_vx_back": EXEC_MAX_VX_BACK, "max_vyaw": EXEC_START_VYAW}
 
     def set_limits(self, body: dict) -> None:
         """Lower (or restore) the working limits. A value above the hard cap,

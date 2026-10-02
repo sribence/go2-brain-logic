@@ -73,7 +73,7 @@ def test_forward_command_when_far_and_ramped():
     f, t = locked_follower(x=3.0)
     out = f.update([person(1, 3.0, 0.0)], {1: RED}, t + DT)
     cmd = out["command"]
-    assert cmd["vx_desired"] == pytest.approx(0.5)     # clamped to max_vx
+    assert cmd["vx_desired"] == pytest.approx(FollowConfig().max_vx)     # clamped to max_vx
     assert 0 < cmd["vx"] <= cmd["vx_desired"]            # ramped, not a step
     assert out["goal"]["distance_cm"] == 180             # 3.0 - 1.2 m
 
